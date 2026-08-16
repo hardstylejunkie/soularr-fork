@@ -255,3 +255,33 @@ require_proof_album_types = Album
         log = RecordingLogger()
         policy.TypePolicy(make_config(STOCK_CONFIG)).validate(log)
         assert log.warnings == []
+
+
+class TestSceneReleaseQualifies:
+    def test_scene_flac_name_matching_album(self):
+        assert policy.scene_release_qualifies("Adele-21-CD-FLAC-2011-GRMFLAC", "Adele", "21")
+
+    def test_bracket_flac_community_name(self):
+        assert policy.scene_release_qualifies("Fleetwood Mac - Rumours (1977) [FLAC]", "Fleetwood Mac", "Rumours")
+
+    def test_wrong_artist_rejected(self):
+        assert not policy.scene_release_qualifies("Adele-21-CD-FLAC-2011-GRMFLAC", "Fleetwood Mac", "Rumours")
+
+    def test_mp3_scene_name_rejected(self):
+        assert not policy.scene_release_qualifies("Adele-21-CD-MP3-320-2011-GRP", "Adele", "21")
+
+    def test_no_flac_token_rejected(self):
+        # A nicely named folder without an explicit FLAC tag is not scene proof
+        assert not policy.scene_release_qualifies("Adele - 21 (2011)", "Adele", "21")
+
+    def test_unparseable_name_rejected(self):
+        assert not policy.scene_release_qualifies("random junk folder", "Adele", "21")
+
+
+class TestSceneAcceptConfig:
+    def test_default_true(self):
+        assert policy.TypePolicy(make_config(STOCK_CONFIG)).scene_accept is True
+
+    def test_configured_false(self):
+        config = make_config(STOCK_CONFIG + "proof_accept_scene_names = False\n")
+        assert policy.TypePolicy(config).scene_accept is False

@@ -32,6 +32,11 @@ All keys live in `config.ini`. New logic sits in the `soularr_fork/` package
   containing every proof extension and no audio besides FLAC. Soularr iterates
   search candidates until one passes the gate. Empty = gate off.
 - `proof_files` — extensions the folder must contain (default `log,cue`).
+- `proof_accept_scene_names` — proof requirement is also satisfied by a folder
+  whose leaf name parses (via the Lidarr parser port) to the wanted artist +
+  album with an explicit FLAC token — scene/WEB FLAC releases have no log/cue
+  by nature. Folder contents must still be all-FLAC. `False` = log+cue only.
+  Default on (only matters for types listed in `require_proof_album_types`).
 - `max_directory_probes` — cap on user directory fetches per album while
   hunting a proof-verified folder (default `30`).
 

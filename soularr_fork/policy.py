@@ -3,6 +3,9 @@ import logging
 import os
 from datetime import datetime, timedelta
 
+from .nameparse import parse_folder_name
+from .normalize import normalize_title
+
 logger = logging.getLogger("soularr")
 
 AUDIO_EXTS = {"flac", "mp3", "m4a", "aac", "ogg", "opus", "wma", "ape", "wav", "aiff", "aif", "alac", "wv", "dsf", "dff", "mpc", "mp2", "m4b", "shn", "tta"}
@@ -58,6 +61,7 @@ class TypePolicy:
         self.proof_types = parse_name_set(config.get(section, "require_proof_album_types", fallback=""))
         self.proof_exts = {ext.strip().lstrip(".").lower() for ext in config.get(section, "proof_files", fallback="log,cue").split(",") if ext.strip()}
         self.max_probes = config.getint(section, "max_directory_probes", fallback=30)
+        self.scene_accept = config.getboolean(section, "proof_accept_scene_names", fallback=True)
 
     def processes(self, album_type):
         if self.processed is None:
@@ -107,6 +111,28 @@ def folder_audio_clean(files):
     return True
 
 
+
+
+def _names_consistent(parsed_name, lidarr_name):
+    parsed_fold = parsed_name.casefold()
+    lidarr_fold = lidarr_name.casefold()
+    if parsed_fold in lidarr_fold or lidarr_fold in parsed_fold:
+        return True
+    return normalize_title(parsed_name) == normalize_title(lidarr_name)
+
+
+def scene_release_qualifies(leaf_name, artist, title):
+    """
+    Alternative proof: the folder's leaf name parses (Lidarr-style) to THIS
+    album with an explicit FLAC token. WEB/scene FLAC releases carry no
+    log/cue by nature; a correctly named release with a FLAC tag is accepted
+    when proof_accept_scene_names is on. Folder contents must still pass
+    folder_audio_clean.
+    """
+    parsed = parse_folder_name(leaf_name)
+    if parsed is None or not parsed.artist or not parsed.album or parsed.codec != "FLAC":
+        return False
+    return _names_consistent(parsed.artist, artist) and _names_consistent(parsed.album, title)
 def load_staged(file_path):
     if not os.path.exists(file_path):
         return {}

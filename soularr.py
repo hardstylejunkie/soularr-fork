@@ -412,8 +412,14 @@ def check_for_match(tracks, allowed_filetype, file_dirs, username, gate=None):
 
         if gate is not None and gate["require_proof"]:
             files = directory.get("files", [])
-            if not fork_policy.folder_proof_ok(files, gate["proof_exts"]) or not fork_policy.folder_audio_clean(files):
-                logger.debug(f"Folder failed proof gate: {file_dir}")
+            if not fork_policy.folder_audio_clean(files):
+                logger.debug(f"Folder failed audio-clean gate: {file_dir}")
+                continue
+            if not fork_policy.folder_proof_ok(files, gate["proof_exts"]) and not (
+                gate["scene_accept"]
+                and fork_policy.scene_release_qualifies(file_dir.rsplit("\\", 1)[-1], gate["artist"], gate["title"])
+            ):
+                logger.debug(f"Folder failed proof gate (no proof files, not a matching scene name): {file_dir}")
                 continue
 
         track_num = len(tracks)
@@ -847,6 +853,7 @@ def build_album_gate(album):
         "artist": album["artist"]["artistName"],
         "title": album["title"],
         "proof_seen": proof_seen_cache.get(album["id"], set()),
+        "scene_accept": type_policy.scene_accept,
         "ladder": type_policy.ladder_for(album.get("albumType")),
     }
 
