@@ -105,7 +105,56 @@ Soularr's search list.
 
 With `disable_sync = True` the replacement lands in the staging folder for
 manual import — deliberate: replacing existing files goes through your
-review, not an automatic import.
+review, not an automatic import. (Unless promote is on — see below.)
+
+### Promote (auto-import, token naming)
+
+`[Download Settings]`
+
+- `promote_completed` — the fork's own auto-import for the `disable_sync =
+  True` workflow (off = staging behaves exactly as today). Off by default.
+- `recycle_bin` — where replaced old album folders are moved (default
+  `/data/media/music/.RecycleBin`). Nothing is ever deleted.
+
+The library's custom-format scores are driven by **folder-name tokens**:
+`[LOG+CUE]` (+18), `[CD]`/`[WEB]`, the `FLAC` token, and a trailing `-GROUP`
+release-group suffix (its absence scores No-RlsGroup). Lidarr's own
+RenameFiles is therefore **never used** — it would strip those tokens.
+Albums enter the library by moving a fully-named folder into the artist
+directory and letting Lidarr map the files in place.
+
+Promote automates exactly that. When a download completes it composes the
+library convention:
+
+```
+{Artist} - {Title} ({Year})[ [Release Disambiguation]] [{Medium}][FLAC {Depth}bit][LOG+CUE][-GROUP]
+```
+
+- Medium comes from the chosen Lidarr release's `format` (`CD`/`Digital
+  Media`→`WEB`/`Vinyl`), falling back to the source parsed from the original
+  slskd folder name, then CD/WEB by proof presence.
+- Depth is read from the first FLAC's STREAMINFO block (a bare `[FLAC]`
+  token when unreadable). `[LOG+CUE]` appears when the folder holds both a
+  `.log` and a `.cue`; the release group comes from parsing the original
+  slskd folder name.
+
+Flow: **move → refresh → verify → recycle**. The staged folder is moved into
+the artist directory (created if missing) under the composed name, a
+`RefreshArtist` command is posted and awaited, then the album's trackfiles
+are re-fetched to verify at least one now lives inside the new folder. Only
+after that verification are old folders the album no longer references moved
+into `recycle_bin/replaced-<YYYYMMDD>/` — never deleted, and never touched if
+still referenced.
+
+Fail-open semantics: every error logs a warning and returns without crashing
+the run loop. A failure before the move leaves the folder in staging; a
+failure after it (refresh error, verify miss) leaves the folder in the artist
+directory where the next root-folder rescan retries the mapping. Nothing
+outside the recycle-bin move ever removes a folder.
+
+Requirement: the download staging dir must live **outside** the Lidarr root
+folder — `RefreshArtist` rescans the root, and a staging dir inside it would
+get scanned mid-download.
 
 ## Homelab config example
 
@@ -128,6 +177,7 @@ search_sort_key = artists.sortname
 [Download Settings]
 skip_already_staged = True
 staged_memory_days = 7
+promote_completed = True
 ```
 
 ## Upstream sync

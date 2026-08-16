@@ -22,6 +22,7 @@ from slskd_api.apis import users
 from soularr_fork import nameparse as fork_nameparse
 from soularr_fork import normalize as fork_normalize
 from soularr_fork import policy as fork_policy
+from soularr_fork import promote as fork_promote
 from soularr_fork.cfsweep import CfSweep
 from soularr_fork.dedup import SingleDedup
 
@@ -97,6 +98,8 @@ staged_albums_file_path = None
 cf_below_threshold = None
 cf_artists_per_run = None
 cf_artist_cursor_file_path = None
+promote_completed = None
+recycle_bin = None
 
 # === Runtime State & Caches ===
 search_cache = {}
@@ -900,6 +903,7 @@ def find_download(album, grab_list):
                 grab_list[album_id]["title"] = album["title"]
                 grab_list[album_id]["artist"] = artist_name
                 grab_list[album_id]["year"] = album["releaseDate"][0:4]
+                grab_list[album_id]["release"] = release  # Fork: promote needs the chosen release's format/disambiguation
                 record_staged_grab(album)
                 return True
             elif len(release["media"]) > 1:
@@ -911,6 +915,7 @@ def find_download(album, grab_list):
                     grab_list[album_id]["title"] = album["title"]
                     grab_list[album_id]["artist"] = artist_name
                     grab_list[album_id]["year"] = album["releaseDate"][0:4]
+                    grab_list[album_id]["release"] = release  # Fork: promote needs the chosen release's format/disambiguation
                     record_staged_grab(album)
                     return True
     return False
@@ -936,6 +941,41 @@ def search_and_queue(albums):
                 time.sleep(remaining)
 
     return grab_list, failed_search, failed_grab
+
+
+def promote_album(album_data, staged_dir):
+    """
+    Fork auto-import: compose the library's token folder name and hand the
+    staged folder to the Promoter (move -> RefreshArtist -> verify -> recycle).
+    Fail-open: any error leaves the folder in staging with a warning.
+    """
+    try:
+        album = lidarr.get_album(album_data["album_id"])
+        original_folder = album_data["files"][0]["file_dir"].rstrip("\\/").rsplit("\\", 1)[-1]
+        parsed = fork_nameparse.parse_folder_name(original_folder)
+        entries = os.listdir(staged_dir)
+        has_proof = any(entry.lower().endswith(".log") for entry in entries) and any(entry.lower().endswith(".cue") for entry in entries)
+        release = album_data.get("release") or {}
+        name = fork_promote.compose_folder_name(
+            artist_name=album["artist"]["artistName"],
+            album_title=album["title"],
+            year=album_data["year"],
+            disambiguation=release.get("disambiguation") or album.get("disambiguation"),
+            medium=fork_promote.medium_from_release(release, parsed.source if parsed else None, has_proof),
+            depth=fork_promote.flac_bit_depth(staged_dir),
+            has_proof=has_proof,
+            release_group=parsed.release_group if parsed else None,
+        )
+        promoter = fork_promote.Promoter(lidarr, logger, recycle_bin)
+        promoted, detail = promoter.promote(album, staged_dir, name)
+        if promoted:
+            logger.info(f"Promoted {album_data['artist']} - {album_data['title']} -> {detail}")
+            if staged_albums_file_path:
+                fork_policy.clear_staged(staged_albums_file_path, album_data["album_id"])
+        else:
+            logger.warning(f"Promote incomplete for {album_data['artist']} - {album_data['title']}: {detail}")
+    except Exception:
+        logger.exception(f"Promote failed for {album_data['artist']} - {album_data['title']}; folder left in staging")
 
 
 def process_completed_album(album_data, failed_grab):
@@ -991,6 +1031,9 @@ def process_completed_album(album_data, failed_grab):
                 except OSError:
                     logger.warning(f"Skipping removal of {rm_dir} because it's not empty.")
         if lidarr_disable_sync:
+            if promote_completed:
+                promote_album(album_data, import_folder_fullpath)
+                return
             logger.info(f"Sync disabled. Skipping Lidarr import of {album_data['artist']} - {album_data['title']}")
             return
         logger.info(f"Attempting Lidarr import of {album_data['artist']} - {album_data['title']}")
@@ -1478,6 +1521,8 @@ def main():
         cf_below_threshold, \
         cf_artists_per_run, \
         cf_artist_cursor_file_path, \
+        promote_completed, \
+        recycle_bin, \
         lidarr, \
         slskd, \
         config, \
@@ -1613,6 +1658,8 @@ def main():
         sanitize_search_queries = config.getboolean("Search Settings", "sanitize_search_queries", fallback=False)
         skip_already_staged = config.getboolean("Download Settings", "skip_already_staged", fallback=False)
         staged_memory_days = config.getint("Download Settings", "staged_memory_days", fallback=7)
+        promote_completed = config.getboolean("Download Settings", "promote_completed", fallback=False)
+        recycle_bin = config.get("Download Settings", "recycle_bin", fallback="/data/media/music/.RecycleBin")
         cf_below_threshold = config.getint("Search Settings", "cf_below_threshold", fallback=0)
         cf_artists_per_run = config.getint("Search Settings", "cf_artists_per_run", fallback=10)
 
