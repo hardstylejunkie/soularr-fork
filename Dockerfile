@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements.txt soularr.py run.sh .
 COPY webui/ webui/
 COPY resources/ resources/
+COPY soularr_fork/ soularr_fork/
 
 RUN apt-get update \
     && apt-get install -y tini \

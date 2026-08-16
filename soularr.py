@@ -19,6 +19,11 @@ import slskd_api
 from pyarr import LidarrAPI
 from slskd_api.apis import users
 
+from soularr_fork import nameparse as fork_nameparse
+from soularr_fork import normalize as fork_normalize
+from soularr_fork import policy as fork_policy
+from soularr_fork.dedup import SingleDedup
+
 
 class EnvInterpolation(configparser.ExtendedInterpolation):
     """
@@ -60,6 +65,7 @@ slskd_url_base = None
 ignored_users = []
 search_type = None
 search_source = None
+search_sort_key = "albums.title"
 download_filtering = None
 use_extension_whitelist = None
 extensions_whitelist = []
@@ -81,11 +87,19 @@ lock_file_path = None
 config_file_path = None
 current_page_file_path = None
 search_blacklist = []
+type_policy = None
+skip_singles_on_albums = None
+sanitize_search_queries = None
+skip_already_staged = None
+staged_memory_days = None
+staged_albums_file_path = None
 
 # === Runtime State & Caches ===
 search_cache = {}
 folder_cache = {}
 broken_user = []
+proof_seen_cache = {}
+single_dedup = None
 
 
 def album_match(lidarr_tracks, slskd_tracks, username, filetype):
@@ -146,9 +160,13 @@ def check_ratio(separator, ratio, lidarr_filename, slskd_filename):
     return ratio
 
 
-def album_track_num(directory):
+def album_track_num(directory, filetypes=None):
     files = directory["files"]
-    allowed_filetypes_no_attributes = [item.split(" ")[0] for item in allowed_filetypes]
+    # Count/uniformity must use the active per-album ladder, not the global
+    # union of all ladders, or extra rungs poison the mixed-filetype check
+    if filetypes is None:
+        filetypes = allowed_filetypes
+    allowed_filetypes_no_attributes = [item.split(" ")[0] for item in filetypes]
     count = 0
     index = -1
     filetype = ""
@@ -309,7 +327,7 @@ def verify_filetype(file, allowed_filetype):
         return False
 
 
-def download_filter(allowed_filetype, directory):
+def download_filter(allowed_filetype, directory, gate=None):
     """
     Filters the directory listing from SLSKD using the filetype whitelist.
     If not using the whitelist it will only return the audio files of the allowed filetype.
@@ -322,6 +340,11 @@ def download_filter(allowed_filetype, directory):
         if use_extension_whitelist:
             whitelist = copy.deepcopy(extensions_whitelist)  # Copy the whitelist to allow us to append the allowed_filetype
         whitelist.append(allowed_filetype.split(" ")[0])
+        if gate is not None and gate["require_proof"]:
+            # Proof files the match was gated on must survive filtering
+            for ext in gate["proof_exts"]:
+                if ext not in whitelist:
+                    whitelist.append(ext)
         unwanted = []
         logger.debug(f"Accepted extensions: {whitelist}")
         for file in directory["files"]:
@@ -345,7 +368,7 @@ def download_filter(allowed_filetype, directory):
     return directory  # If we didn't find unwanted files or we aren't filtering just return the original list
 
 
-def check_for_match(tracks, allowed_filetype, file_dirs, username):
+def check_for_match(tracks, allowed_filetype, file_dirs, username, gate=None):
     """
     Does the actual match checking on a single disk/album.
     """
@@ -358,6 +381,13 @@ def check_for_match(tracks, allowed_filetype, file_dirs, username):
             folder_cache[username] = {}
 
         if file_dir not in folder_cache[username]:
+            if gate is not None and gate["require_proof"]:
+                if gate["probes_left"] <= 0:
+                    if not gate.get("cap_logged"):
+                        logger.info("Max directory probes reached for this album. Skipping remaining uncached folders.")
+                        gate["cap_logged"] = True
+                    continue
+                gate["probes_left"] -= 1
             logger.info(f"User: {username} Folder: {file_dir} not in cache. Fetching from SLSKD")
             version = slskd.application.version()
             version_check = slskd_version_check(version)
@@ -380,8 +410,14 @@ def check_for_match(tracks, allowed_filetype, file_dirs, username):
             logger.info(f"User: {username} Folder: {file_dir} in cache. Using cached value")
             directory = copy.deepcopy(folder_cache[username][file_dir])
 
+        if gate is not None and gate["require_proof"]:
+            files = directory.get("files", [])
+            if not fork_policy.folder_proof_ok(files, gate["proof_exts"]) or not fork_policy.folder_audio_clean(files):
+                logger.debug(f"Folder failed proof gate: {file_dir}")
+                continue
+
         track_num = len(tracks)
-        tracks_info = album_track_num(directory)
+        tracks_info = album_track_num(directory, gate["ladder"] if gate is not None else None)
 
         if tracks_info["count"] == track_num and tracks_info["filetype"] != "":
             if album_match(tracks, directory["files"], username, allowed_filetype):
@@ -396,6 +432,36 @@ def is_blacklisted(title: str) -> bool:
     for word in blacklist:
         if word != "" and word in title.lower():
             logger.info(f"Skipping {title} due to blacklisted word: {word}")
+            return True
+    return False
+
+
+def fork_should_skip(album):
+    """
+    Fork policy gates applied per wanted record: album-type filter,
+    single-on-album dedup and staged-download dedup.
+    """
+    global single_dedup
+    artist_name = album["artist"]["artistName"]
+    album_type = album.get("albumType")
+    if type_policy is not None and not type_policy.processes(album_type):
+        logger.info(f"Skipping album type {album_type}: {artist_name} - {album['title']}")
+        return True
+    if skip_singles_on_albums:
+        if single_dedup is None:
+            single_dedup = SingleDedup(lidarr, logger)
+        skip, reason = single_dedup.should_skip(album)
+        if skip:
+            logger.info(f"F4 skip: {artist_name} - {album['title']}: {reason}")
+            return True
+    if skip_already_staged:
+        year = (album.get("releaseDate") or "")[0:4]
+        staged_folder = sanitize_folder_name(artist_name + " - " + album["title"] + " (" + year + ")")
+        if os.path.isdir(os.path.join(slskd_download_dir, staged_folder)):
+            logger.info(f"Skipping already staged album: {artist_name} - {album['title']} (folder: {staged_folder})")
+            return True
+        if fork_policy.is_staged(staged_albums_file_path, album["id"], staged_memory_days):
+            logger.info(f"Skipping recently staged album: {artist_name} - {album['title']} (ID: {album['id']})")
             return True
     return False
 
@@ -422,6 +488,8 @@ def filter_list(albums):
         if is_blacklisted(album["title"]):
             logger.info(f"Skipping blacklisted album: {album['artist']['artistName']} - {album['title']} (ID: {album['id']}")
             continue
+        elif fork_should_skip(album):
+            continue
         else:
             list_to_download.append(album)
 
@@ -429,6 +497,41 @@ def filter_list(albums):
         return list_to_download
     else:
         return None
+
+
+def execute_search(query):
+    """
+    Runs a single slskd text search and returns the responses.
+    Returns None on failure (as opposed to an empty result list).
+    """
+    try:
+        search = slskd.searches.search_text(
+            searchText=query,
+            searchTimeout=config.getint("Search Settings", "search_timeout", fallback=5000),
+            filterResponses=True,
+            maximumPeerQueueLength=config.getint("Search Settings", "maximum_peer_queue", fallback=50),
+            minimumPeerUploadSpeed=config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
+        )
+    except Exception:
+        logger.exception(f"Failed to perform search via SLSKD: {query}")
+        return None
+
+    # Add timeout here to increase reliability with Slskd. Sometimes it doesn't update search status fast enough. More of an issue with lots of historical searches in slskd
+    time.sleep(5)
+    start_time = time.time()
+    while True:
+        if slskd.searches.state(search["id"], False)["state"] != "InProgress":  # Added False here as we don't want the search results here. Just the state.
+            break
+        time.sleep(1)
+        if (time.time() - start_time) > config.getint("Search Settings", "search_timeout", fallback=5000):
+            logger.error("Failed to perform search via SLSKD due to timeout on search results.")
+            return None
+
+    search_results = slskd.searches.search_responses(search["id"])  # We use this API call twice. Let's just cache it locally.
+    logger.info(f"Search returned {len(search_results)} results")
+    if delete_searches:
+        slskd.searches.delete(search["id"])
+    return search_results
 
 
 def search_for_album(album):
@@ -453,34 +556,25 @@ def search_for_album(album):
     if query != original_query:
         logger.info(f"Filtered search query: '{original_query}' -> '{query}'")
 
+    raw_query = query
+    if sanitize_search_queries:
+        # An empty or unchanged sanitized query means there is nothing to gain
+        # from a sanitized attempt (searching '' errors out) — search raw once.
+        sanitized_query = fork_nameparse.sanitize_search_query(raw_query)
+        if sanitized_query and sanitized_query != raw_query:
+            logger.info(f"Sanitized search query: '{raw_query}' -> '{sanitized_query}'")
+            query = sanitized_query
+
     logger.info(f"Searching for album: {query}")
-    try:
-        search = slskd.searches.search_text(
-            searchText=query,
-            searchTimeout=config.getint("Search Settings", "search_timeout", fallback=5000),
-            filterResponses=True,
-            maximumPeerQueueLength=config.getint("Search Settings", "maximum_peer_queue", fallback=50),
-            minimumPeerUploadSpeed=config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
-        )
-    except Exception:
-        logger.exception(f"Failed to perform search via SLSKD: {query}")
+    search_results = execute_search(query)
+    if not search_results and query != raw_query:
+        # Sanitized attempt failed (None) or returned nothing ([]) — retry raw once
+        logger.info(f"No results for sanitized query. Retrying with raw query: {raw_query}")
+        if minimum_search_interval > 0:
+            time.sleep(minimum_search_interval)
+        search_results = execute_search(raw_query)
+    if search_results is None:
         return False
-
-    # Add timeout here to increase reliability with Slskd. Sometimes it doesn't update search status fast enough. More of an issue with lots of historical searches in slskd
-    time.sleep(5)
-    start_time = time.time()
-    while True:
-        if slskd.searches.state(search["id"], False)["state"] != "InProgress":  # Added False here as we don't want the search results here. Just the state.
-            break
-        time.sleep(1)
-        if (time.time() - start_time) > config.getint("Search Settings", "search_timeout", fallback=5000):
-            logger.error("Failed to perform search via SLSKD due to timeout on search results.")
-            return False
-
-    search_results = slskd.searches.search_responses(search["id"])  # We use this API call twice. Let's just cache it locally.
-    logger.info(f"Search returned {len(search_results)} results")
-    if delete_searches:
-        slskd.searches.delete(search["id"])
 
     if not len(search_results) > 0:
         return False
@@ -498,6 +592,9 @@ def search_for_album(album):
         # Search the returned files and only cache files that are of the allowed_filetypes
         for file in init_files:
             file_dir = file["filename"].rsplit("\\", 1)[0]  # split dir/filenames on \
+            if type_policy is not None and fork_policy.file_ext(file["filename"]) in type_policy.proof_exts:
+                # Remember folders whose search response already showed a proof file so try_enqueue can probe them first
+                proof_seen_cache.setdefault(album_id, set()).add((username, file_dir))
             for allowed_filetype in allowed_filetypes:
                 if verify_filetype(file, allowed_filetype):  # Check the filename for an allowed type
                     if allowed_filetype not in search_cache[album_id][username]:
@@ -585,19 +682,52 @@ def downloads_all_done(downloads):
     return all_done, error_list, remote_queue
 
 
-def try_enqueue(all_tracks, results, allowed_filetype):
+def names_consistent(parsed_name, lidarr_name):
+    parsed_fold = parsed_name.casefold()
+    lidarr_fold = lidarr_name.casefold()
+    if parsed_fold in lidarr_fold or lidarr_fold in parsed_fold:
+        return True
+    return fork_normalize.normalize_title(parsed_name) == fork_normalize.normalize_title(lidarr_name)
+
+
+def candidate_rank(username, file_dir, gate):
+    if (username, file_dir) in gate["proof_seen"]:
+        return 0
+    parsed = fork_nameparse.parse_folder_name(file_dir.rsplit("\\", 1)[-1])
+    if parsed is not None and parsed.artist and parsed.album:
+        if names_consistent(parsed.artist, gate["artist"]) and names_consistent(parsed.album, gate["title"]):
+            return 1
+    return 2
+
+
+def iter_candidates(results, allowed_filetype, gate):
+    """
+    Yields (username, file_dirs) pairs to probe. Upstream order unless proof is
+    required, in which case candidates whose search response already showed a
+    proof file come first, then folders whose parsed name matches the album.
+    """
+    candidates = [(username, results[username][allowed_filetype]) for username in results if allowed_filetype in results[username]]
+    if gate is None or not gate["require_proof"]:
+        return candidates
+    ranked = []
+    for user_pos, (username, file_dirs) in enumerate(candidates):
+        scored = sorted((candidate_rank(username, file_dir, gate), dir_pos, file_dir) for dir_pos, file_dir in enumerate(file_dirs))
+        best_rank = scored[0][0] if scored else 2
+        ranked.append((best_rank, user_pos, username, [entry[2] for entry in scored]))
+    ranked.sort(key=lambda entry: (entry[0], entry[1]))
+    return [(username, file_dirs) for _, _, username, file_dirs in ranked]
+
+
+def try_enqueue(all_tracks, results, allowed_filetype, gate=None):
     """
     Single album match and enqueue.
     Iterates over all users and enqueues a found match
     """
-    for username in results:
-        if allowed_filetype not in results[username]:
-            continue
+    for username, file_dirs in iter_candidates(results, allowed_filetype, gate):
         logger.debug(f"Parsing result from user: {username}")
-        file_dirs = results[username][allowed_filetype]
-        found, directory, file_dir = check_for_match(all_tracks, allowed_filetype, file_dirs, username)
+        found, directory, file_dir = check_for_match(all_tracks, allowed_filetype, file_dirs, username, gate)
         if found:
-            directory = download_filter(allowed_filetype, directory)
+            directory = download_filter(allowed_filetype, directory, gate)
             for i in range(0, len(directory["files"])):
                 directory["files"][i]["filename"] = file_dir + "\\" + directory["files"][i]["filename"]
             try:
@@ -623,7 +753,7 @@ def try_enqueue(all_tracks, results, allowed_filetype):
     return False, None
 
 
-def try_multi_enqueue(release, all_tracks, results, allowed_filetype):
+def try_multi_enqueue(release, all_tracks, results, allowed_filetype, gate=None):
     """
     This is the multi-disk/media path for locating and enqueueing an album
     It does a flat search first. Then it does a split search.
@@ -644,13 +774,10 @@ def try_multi_enqueue(release, all_tracks, results, allowed_filetype):
     total = len(split_release)
     count_found = 0
     for disk in split_release:
-        for username in tmp_results:
-            if allowed_filetype not in tmp_results[username]:
-                continue
-            file_dirs = results[username][allowed_filetype]
-            found, directory, file_dir = check_for_match(disk["tracks"], allowed_filetype, file_dirs, username)
+        for username, file_dirs in iter_candidates(tmp_results, allowed_filetype, gate):
+            found, directory, file_dir = check_for_match(disk["tracks"], allowed_filetype, file_dirs, username, gate)
             if found:
-                directory = download_filter(allowed_filetype, directory)
+                directory = download_filter(allowed_filetype, directory, gate)
                 disk["source"] = (username, directory, file_dir)
                 count_found += 1
                 break
@@ -706,6 +833,29 @@ def try_multi_enqueue(release, all_tracks, results, allowed_filetype):
         return False, None
 
 
+def build_album_gate(album):
+    """
+    Per-album policy view handed down to try_enqueue/check_for_match.
+    None (e.g. in tests without a configured policy) preserves upstream behavior.
+    """
+    if type_policy is None:
+        return None
+    return {
+        "require_proof": type_policy.requires_proof(album.get("albumType")),
+        "proof_exts": type_policy.proof_exts,
+        "probes_left": type_policy.max_probes,
+        "artist": album["artist"]["artistName"],
+        "title": album["title"],
+        "proof_seen": proof_seen_cache.get(album["id"], set()),
+        "ladder": type_policy.ladder_for(album.get("albumType")),
+    }
+
+
+def record_staged_grab(album):
+    if skip_already_staged:
+        fork_policy.record_staged(staged_albums_file_path, album["id"], album["title"])
+
+
 def find_download(album, grab_list):
     """
     This does the main loop over search results and user directories
@@ -716,7 +866,9 @@ def find_download(album, grab_list):
     artist_name = album["artist"]["artistName"]
     artist_id = album["artistId"]
     results = search_cache[album_id]
-    for allowed_filetype in allowed_filetypes:
+    gate = build_album_gate(album)
+    ladder = gate["ladder"] if gate is not None else allowed_filetypes
+    for allowed_filetype in ladder:
         logger.info(f"Checking for Quality: {allowed_filetype}")
         releases = lidarr.get_album(album_id)["releases"]
         num_releases = len(releases)
@@ -727,7 +879,7 @@ def find_download(album, grab_list):
             releases.remove(release)
             release_id = release["id"]
             all_tracks = lidarr.get_tracks(artistId=artist_id, albumId=album_id, albumReleaseId=release_id)
-            found, downloads = try_enqueue(all_tracks, results, allowed_filetype)
+            found, downloads = try_enqueue(all_tracks, results, allowed_filetype, gate)
 
             if found:
                 grab_list[album_id] = {}
@@ -736,9 +888,10 @@ def find_download(album, grab_list):
                 grab_list[album_id]["title"] = album["title"]
                 grab_list[album_id]["artist"] = artist_name
                 grab_list[album_id]["year"] = album["releaseDate"][0:4]
+                record_staged_grab(album)
                 return True
             elif len(release["media"]) > 1:
-                found, downloads = try_multi_enqueue(release, all_tracks, results, allowed_filetype)
+                found, downloads = try_multi_enqueue(release, all_tracks, results, allowed_filetype, gate)
                 if found:
                     grab_list[album_id] = {}
                     grab_list[album_id]["files"] = downloads
@@ -746,6 +899,7 @@ def find_download(album, grab_list):
                     grab_list[album_id]["title"] = album["title"]
                     grab_list[album_id]["artist"] = artist_name
                     grab_list[album_id]["year"] = album["releaseDate"][0:4]
+                    record_staged_grab(album)
                     return True
     return False
 
@@ -812,6 +966,9 @@ def process_completed_album(album_data, failed_grab):
                 os.rmdir(import_folder_fullpath)
             except OSError:
                 logger.warning(f"Could not remove temp import directory {import_folder_fullpath}")
+            if staged_albums_file_path:
+                # Nothing staged anymore, so don't let staged-memory block a retry
+                fork_policy.clear_staged(staged_albums_file_path, album_data["album_id"])
             failed_grab.append(lidarr.get_album(album_data["album_id"]))
             return
     else:  # Only runs if all files are successfully moved
@@ -859,6 +1016,9 @@ def process_completed_album(album_data, failed_grab):
 
             if "Failed" in current_task["message"]:
                 folder_path = move_failed_import(current_task["body"]["path"])
+                if staged_albums_file_path:
+                    # Folder moved to the failed-imports dir, so nothing is staged anymore
+                    fork_policy.clear_staged(staged_albums_file_path, album_data["album_id"])
                 failed_grab.append(lidarr.get_album(album_data["album_id"]))
                 if failed_import_denylist:
                     add_to_failed_import_denylist(
@@ -868,6 +1028,8 @@ def process_completed_album(album_data, failed_grab):
                         album_data["title"],
                         folder_path,
                     )
+            elif staged_albums_file_path:
+                fork_policy.clear_staged(staged_albums_file_path, album_data["album_id"])
         except Exception:
             logger.exception("Error printing lidarr task message")
             logger.error(current_task)
@@ -878,6 +1040,9 @@ def monitor_downloads(grab_list, failed_grab):
 
     def delete_album(reason):
         cancel_and_delete(grab_list[album_id]["files"])
+        if staged_albums_file_path:
+            # Nothing staged anymore, so don't let staged-memory block a retry
+            fork_policy.clear_staged(staged_albums_file_path, album_id)
         logger.info(f"{reason} Album: {grab_list[album_id]['title']} Artist: {grab_list[album_id]['artist']}")
         del grab_list[album_id]
         failed_grab.append(lidarr.get_album(album_id))
@@ -1110,7 +1275,7 @@ def get_records(missing: bool) -> list:
         wanted = lidarr.get_wanted(
             page_size=page_size,
             sort_dir="ascending",
-            sort_key="albums.title",
+            sort_key=search_sort_key,
             missing=missing,
         )
     except ConnectionError as ex:
@@ -1128,7 +1293,7 @@ def get_records(missing: bool) -> list:
                     page=page,
                     page_size=page_size,
                     sort_dir="ascending",
-                    sort_key="albums.title",
+                    sort_key=search_sort_key,
                     missing=missing,
                 )
             except ConnectionError as ex:
@@ -1143,7 +1308,7 @@ def get_records(missing: bool) -> list:
                 page=page,
                 page_size=page_size,
                 sort_dir="ascending",
-                sort_key="albums.title",
+                sort_key=search_sort_key,
                 missing=missing,
             )["records"]
         except ConnectionError as ex:
@@ -1253,6 +1418,7 @@ def main():
         ignored_users, \
         search_type, \
         search_source, \
+        search_sort_key, \
         download_filtering, \
         use_extension_whitelist, \
         extensions_whitelist, \
@@ -1274,13 +1440,21 @@ def main():
         config_file_path, \
         current_page_file_path, \
         search_blacklist, \
+        type_policy, \
+        skip_singles_on_albums, \
+        sanitize_search_queries, \
+        skip_already_staged, \
+        staged_memory_days, \
+        staged_albums_file_path, \
         lidarr, \
         slskd, \
         config, \
         logger, \
         search_cache, \
         folder_cache, \
-        broken_user
+        broken_user, \
+        proof_seen_cache, \
+        single_dedup
 
     # Let's allow some overrides to be passed to the script
     parser = argparse.ArgumentParser(description="""Soularr reads all of your "wanted" albums/artists from Lidarr and downloads them using Slskd""")
@@ -1324,6 +1498,7 @@ def main():
     config_file_path = os.path.join(args.config_dir, "config.ini")
     current_page_file_path = os.path.join(args.var_dir, ".current_page.txt")
     failed_import_denylist_file_path = os.path.join(args.var_dir, "failed_imports.json")
+    staged_albums_file_path = os.path.join(args.var_dir, "staged_albums.json")
 
     if not is_docker() and os.path.exists(lock_file_path) and args.lock_file:
         logger.info(f"Soularr instance is already running.")
@@ -1378,6 +1553,12 @@ def main():
         search_blacklist = [word.strip() for word in search_blacklist if word.strip()]
         search_type = config.get("Search Settings", "search_type", fallback="first_page").lower().strip()
         search_source = config.get("Search Settings", "search_source", fallback="missing").lower().strip()
+        # Lidarr wanted-list sort keys are case-sensitive; normalize from lowercase input.
+        _sort_keys = {"albums.title": "albums.title", "artists.sortname": "artists.sortname", "releasedate": "releaseDate"}
+        _raw_sort_key = config.get("Search Settings", "search_sort_key", fallback="albums.title").lower().strip()
+        if _raw_sort_key not in _sort_keys:
+            logger.warning(f"[Search Settings] search_sort_key '{_raw_sort_key}' is not one of {sorted(_sort_keys)} - using albums.title")
+        search_sort_key = _sort_keys.get(_raw_sort_key, "albums.title")
 
         download_filtering = config.getboolean("Download Settings", "download_filtering", fallback=False)
         use_extension_whitelist = config.getboolean("Download Settings", "use_extension_whitelist", fallback=False)
@@ -1392,6 +1573,12 @@ def main():
         minimum_search_interval = config.getint("Search Settings", "minimum_search_interval", fallback=5)
         page_size = config.getint("Search Settings", "number_of_albums_to_grab", fallback=10)
         failed_import_denylist = config.getboolean("Search Settings", "failed_import_denylist", fallback=True)
+
+        # Fork settings: fallbacks keep a stock upstream config behaving identically
+        skip_singles_on_albums = config.getboolean("Search Settings", "skip_singles_on_albums", fallback=False)
+        sanitize_search_queries = config.getboolean("Search Settings", "sanitize_search_queries", fallback=False)
+        skip_already_staged = config.getboolean("Download Settings", "skip_already_staged", fallback=False)
+        staged_memory_days = config.getint("Download Settings", "staged_memory_days", fallback=7)
 
         use_selected_lidarr_release = config.getboolean("Release Settings", "use_selected_lidarr_release", fallback=False)
         use_most_common_tracknum = config.getboolean("Release Settings", "use_most_common_tracknum", fallback=True)
@@ -1410,10 +1597,17 @@ def main():
         else:
             allowed_filetypes = [raw_filetypes]
 
+        type_policy = fork_policy.TypePolicy(config, allowed_filetypes)
+        type_policy.validate(logger)
+        # Per-type ladders only get cached by search_for_album if the global list covers them
+        allowed_filetypes = type_policy.union_filetypes()
+
         # Init directory cache. The wide search returns all the data we need. This prevents us from hammering the users on the Soulseek network
         search_cache = {}
         folder_cache = {}
         broken_user = []
+        proof_seen_cache = {}
+        single_dedup = None
 
         slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         lidarr = LidarrAPI(lidarr_host_url, lidarr_api_key)
