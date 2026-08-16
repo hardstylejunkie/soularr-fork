@@ -285,3 +285,26 @@ class TestSceneAcceptConfig:
     def test_configured_false(self):
         config = make_config(STOCK_CONFIG + "proof_accept_scene_names = False\n")
         assert policy.TypePolicy(config).scene_accept is False
+
+
+class TestParseSearchSources:
+    def test_single_source(self):
+        assert policy.parse_search_sources("missing") == ["missing"]
+        assert policy.parse_search_sources("cutoff_unmet") == ["cutoff_unmet"]
+
+    def test_all_keeps_upstream_meaning(self):
+        assert policy.parse_search_sources("all") == ["missing", "cutoff_unmet"]
+
+    def test_comma_list_with_cf_below(self):
+        assert policy.parse_search_sources("missing,cf_below") == ["missing", "cf_below"]
+
+    def test_all_inside_list_expands_and_dedupes(self):
+        assert policy.parse_search_sources("missing,all,cf_below") == ["missing", "cutoff_unmet", "cf_below"]
+
+    def test_whitespace_and_case_tolerated(self):
+        assert policy.parse_search_sources(" Missing , CF_Below ") == ["missing", "cf_below"]
+
+    def test_empty_falls_back_to_missing(self):
+        assert policy.parse_search_sources("") == ["missing"]
+        assert policy.parse_search_sources(None) == ["missing"]
+        assert policy.parse_search_sources(",,") == ["missing"]

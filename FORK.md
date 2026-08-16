@@ -80,6 +80,33 @@ All keys live in `config.ini`. New logic sits in the `soularr_fork/` package
   per-artist cache hits), or `releasedate`. Invalid values warn and fall
   back to `albums.title`.
 
+### Replace low-scoring copies (cf_below)
+
+`[Search Settings]`
+
+`search_source` now accepts a comma-separated list (`missing | cutoff_unmet |
+all | e.g. missing,cf_below`; `all` still means missing+cutoff_unmet as
+upstream). Adding `cf_below` makes Soularr hunt archival REPLACEMENT copies
+for albums whose existing files carry a custom-format score below the
+threshold — the user's LQ/vinyl-rip CF flags. Candidates flow through the
+same pipeline as wanted albums, proof/scene gate included. Lidarr's own
+RSS quality/score upgrade machinery is unaffected; this only feeds
+Soularr's search list.
+
+- `cf_below_threshold` — an album qualifies when the minimum of its files'
+  `customFormatScore`s is STRICTLY below this (default `0`). Min-of-files
+  aggregation means a partially bad copy (one flagged file among clean
+  ones) qualifies. Files without a score are ignored, and an album with no
+  scored files never qualifies — missing data is not treated as bad.
+- `cf_artists_per_run` — artists inspected per run (default `10`). A rolling
+  cursor (`.cf_artist_cursor.txt` in the var dir) walks the library in
+  sortName order and wraps at the end, so the whole library gets swept
+  across runs. Only monitored albums of type Album are considered.
+
+With `disable_sync = True` the replacement lands in the staging folder for
+manual import — deliberate: replacing existing files goes through your
+review, not an automatic import.
+
 ## Homelab config example
 
 Albums FLAC-only with log+cue proof; EPs and singles FLAC falling back to

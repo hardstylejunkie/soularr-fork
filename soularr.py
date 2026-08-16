@@ -22,6 +22,7 @@ from slskd_api.apis import users
 from soularr_fork import nameparse as fork_nameparse
 from soularr_fork import normalize as fork_normalize
 from soularr_fork import policy as fork_policy
+from soularr_fork.cfsweep import CfSweep
 from soularr_fork.dedup import SingleDedup
 
 
@@ -93,6 +94,9 @@ sanitize_search_queries = None
 skip_already_staged = None
 staged_memory_days = None
 staged_albums_file_path = None
+cf_below_threshold = None
+cf_artists_per_run = None
+cf_artist_cursor_file_path = None
 
 # === Runtime State & Caches ===
 search_cache = {}
@@ -100,6 +104,7 @@ folder_cache = {}
 broken_user = []
 proof_seen_cache = {}
 single_dedup = None
+cf_sweep = None
 
 
 def album_match(lidarr_tracks, slskd_tracks, username, filetype):
@@ -1277,7 +1282,7 @@ def update_current_page(path: str, page: str) -> None:
         file.write(page)
 
 
-def get_records(missing: bool) -> list:
+def get_wanted_records(missing: bool) -> list:
     try:
         wanted = lidarr.get_wanted(
             page_size=page_size,
@@ -1331,6 +1336,23 @@ def get_records(missing: bool) -> list:
             os.remove(lock_file_path)
 
         raise ValueError(f"[Search Settings] - {search_type = } is not valid")
+
+    return wanted_records
+
+
+def get_records(source: str) -> list:
+    # Fork: the source reaches this decision point as a string so cf_below can
+    # join missing/cutoff_unmet; upstream's boolean is derived from it here.
+    # cf_below records come from the CF sweep (its own rolling artist cursor —
+    # search_type paging does not apply) and still pass through the same
+    # queue filtering below.
+    global cf_sweep
+    if source == "cf_below":
+        if cf_sweep is None:
+            cf_sweep = CfSweep(lidarr, logger, threshold=cf_below_threshold, artists_per_run=cf_artists_per_run, cursor_path=cf_artist_cursor_file_path)
+        wanted_records = cf_sweep.next_batch()
+    else:
+        wanted_records = get_wanted_records(missing=source == "missing")
 
     try:
         queued_records = lidarr.get_queue(sort_dir="ascending", sort_key="albums.title")
@@ -1453,6 +1475,9 @@ def main():
         skip_already_staged, \
         staged_memory_days, \
         staged_albums_file_path, \
+        cf_below_threshold, \
+        cf_artists_per_run, \
+        cf_artist_cursor_file_path, \
         lidarr, \
         slskd, \
         config, \
@@ -1461,7 +1486,8 @@ def main():
         folder_cache, \
         broken_user, \
         proof_seen_cache, \
-        single_dedup
+        single_dedup, \
+        cf_sweep
 
     # Let's allow some overrides to be passed to the script
     parser = argparse.ArgumentParser(description="""Soularr reads all of your "wanted" albums/artists from Lidarr and downloads them using Slskd""")
@@ -1506,6 +1532,7 @@ def main():
     current_page_file_path = os.path.join(args.var_dir, ".current_page.txt")
     failed_import_denylist_file_path = os.path.join(args.var_dir, "failed_imports.json")
     staged_albums_file_path = os.path.join(args.var_dir, "staged_albums.json")
+    cf_artist_cursor_file_path = os.path.join(args.var_dir, ".cf_artist_cursor.txt")
 
     if not is_docker() and os.path.exists(lock_file_path) and args.lock_file:
         logger.info(f"Soularr instance is already running.")
@@ -1572,9 +1599,9 @@ def main():
         extensions_whitelist = config.get("Download Settings", "extensions_whitelist", fallback="txt,nfo,jpg").split(",")
         rename_download_folders = config.getboolean("Download Settings", "rename_download_folders", fallback=True)
 
-        search_sources = [search_source]
-        if search_sources[0] == "all":
-            search_sources = ["missing", "cutoff_unmet"]
+        # Fork: search_source also accepts a comma list (e.g. "missing,cf_below");
+        # 'all' keeps its upstream meaning of missing+cutoff_unmet.
+        search_sources = fork_policy.parse_search_sources(search_source)
 
         minimum_match_ratio = config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5)
         minimum_search_interval = config.getint("Search Settings", "minimum_search_interval", fallback=5)
@@ -1586,6 +1613,8 @@ def main():
         sanitize_search_queries = config.getboolean("Search Settings", "sanitize_search_queries", fallback=False)
         skip_already_staged = config.getboolean("Download Settings", "skip_already_staged", fallback=False)
         staged_memory_days = config.getint("Download Settings", "staged_memory_days", fallback=7)
+        cf_below_threshold = config.getint("Search Settings", "cf_below_threshold", fallback=0)
+        cf_artists_per_run = config.getint("Search Settings", "cf_artists_per_run", fallback=10)
 
         use_selected_lidarr_release = config.getboolean("Release Settings", "use_selected_lidarr_release", fallback=False)
         use_most_common_tracknum = config.getboolean("Release Settings", "use_most_common_tracknum", fallback=True)
@@ -1615,6 +1644,7 @@ def main():
         broken_user = []
         proof_seen_cache = {}
         single_dedup = None
+        cf_sweep = None
 
         slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         lidarr = LidarrAPI(lidarr_host_url, lidarr_api_key)
@@ -1622,8 +1652,7 @@ def main():
         try:
             for source in search_sources:
                 logging.debug(f"Getting records from {source}")
-                missing = source == "missing"
-                wanted_records.extend(get_records(missing))
+                wanted_records.extend(get_records(source))
         except ValueError as ex:
             logger.error(f"An error occurred: {ex}")
             logger.error("Exiting...")

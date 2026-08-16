@@ -46,6 +46,21 @@ def parse_name_set(raw):
     return {name.strip().casefold() for name in raw.split(",") if name.strip()}
 
 
+def parse_search_sources(raw):
+    # search_source accepts a single source or a comma-separated list
+    # (missing | cutoff_unmet | cf_below); 'all' keeps its upstream meaning
+    # of missing+cutoff_unmet. Order is preserved, duplicates dropped.
+    sources = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        for source in ["missing", "cutoff_unmet"] if entry == "all" else [entry]:
+            if source not in sources:
+                sources.append(source)
+    return sources or ["missing"]
+
+
 class TypePolicy:
     def __init__(self, config, base_ladder=None):
         section = "Search Settings"
