@@ -54,6 +54,8 @@ jobs:
 
   build:
     needs: [test]
+    # always() so the skipped sync job (push runs) doesn't auto-skip this too
+    if: always() && needs.test.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
