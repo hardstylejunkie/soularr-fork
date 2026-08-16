@@ -111,10 +111,14 @@ def _inside(path, folder):
 
 class Promoter:
     """Move a completed staging folder into the artist tree and have Lidarr
-    map it in place (RefreshArtist), verifying before retiring old folders.
+    map it in place (RefreshArtist).
 
-    Old album folders left without any trackfile reference after a verified
-    promote are moved (never deleted) into recycle_bin/replaced-<YYYYMMDD>/.
+    Lidarr's rescan NEVER replaces live-mapped files — it only fills fileless
+    tracks (verified 2026-08-16: a +12 candidate would not displace a -15
+    copy). So the old copy is retired BEFORE the refresh: old album folders
+    are moved (never deleted) into recycle_bin/replaced-<YYYYMMDD>/ and their
+    trackfile DB rows removed, leaving the new folder as the only candidate
+    for the scan to map. Old files stay restorable from the recycle bin.
     """
 
     def __init__(self, lidarr, logger, recycle_bin, refresh_timeout=300):
@@ -128,7 +132,7 @@ class Promoter:
             artist_path = album_record["artist"]["path"]
             album_id = album_record["id"]
             os.makedirs(artist_path, exist_ok=True)
-            old_folders = self._trackfile_folders(album_id)
+            old_folders, old_file_ids = self._trackfile_snapshot(album_id)
             new_path = os.path.join(artist_path, name)
             if os.path.exists(new_path):
                 self.logger.warning(f"Promote target already exists, leaving staged folder alone: {new_path}")
@@ -140,6 +144,18 @@ class Promoter:
 
         # From here on the folder lives at new_path; every failure leaves it
         # there (root-folder rescans will retry the mapping).
+
+        # Retire the old copy BEFORE the refresh: the rescan only maps files
+        # onto fileless tracks, so live old files would block the new folder.
+        self._recycle_old_folders(album_record, old_folders, new_path)
+        if old_file_ids:
+            try:
+                self.lidarr.delete_track_file(list(old_file_ids))
+            except Exception as error:
+                # Recycled folders are dead paths now, so the rescan clears
+                # the rows anyway — this only made the mapping deterministic.
+                self.logger.warning(f"Could not delete {len(old_file_ids)} old trackfile rows for album {album_id}: {error}")
+
         try:
             command = self.lidarr.post_command(name="RefreshArtist", artistId=album_record["artistId"])
             self._wait_for_command(command["id"])
@@ -155,21 +171,22 @@ class Promoter:
 
         current_paths = [file.get("path") for file in current if file.get("path")]
         if not any(_inside(path, new_path) for path in current_paths):
-            self.logger.warning(f"Promote not verified: no trackfiles inside {new_path}; folder left in place for rescan")
+            self.logger.warning(f"Promote not verified: no trackfiles inside {new_path}; folder left in place for rescan (old copy restorable from {self.recycle_bin})")
             return False, f"no trackfiles mapped inside {new_path}"
 
-        self._recycle_old_folders(album_record, old_folders, new_path, current_paths)
         return True, new_path
 
-    def _trackfile_folders(self, album_id):
-        """Snapshot of the album's current trackfile folders; empty on error
-        (promote proceeds, only old-folder recycling is skipped)."""
+    def _trackfile_snapshot(self, album_id):
+        """(folders, ids) of the album's current trackfiles; empty on error
+        (promote proceeds, only old-copy retirement is skipped)."""
         try:
             files = self.lidarr.get_track_file(albumId=album_id)
-            return {os.path.normpath(os.path.dirname(file["path"])) for file in files if file.get("path")}
+            folders = {os.path.normpath(os.path.dirname(file["path"])) for file in files if file.get("path")}
+            ids = [file["id"] for file in files if file.get("id")]
+            return folders, ids
         except Exception as error:
             self.logger.warning(f"Could not snapshot existing trackfiles for album {album_id}: {error}")
-            return set()
+            return set(), []
 
     def _wait_for_command(self, command_id):
         deadline = time.time() + self.refresh_timeout
@@ -182,14 +199,12 @@ class Promoter:
                 return
             time.sleep(_REFRESH_POLL_SECONDS)
 
-    def _recycle_old_folders(self, album_record, old_folders, new_path, current_paths):
+    def _recycle_old_folders(self, album_record, old_folders, new_path):
         artist_name = (album_record.get("artist") or {}).get("artistName") or "Unknown Artist"
         for old_folder in old_folders:
             try:
                 if _inside(old_folder, new_path) or _inside(new_path, old_folder):
                     continue
-                if any(_inside(path, old_folder) for path in current_paths):
-                    continue  # still referenced: not replaced, leave it
                 if not os.path.isdir(old_folder):
                     continue
                 day_dir = os.path.join(self.recycle_bin, "replaced-" + datetime.now().strftime("%Y%m%d"))

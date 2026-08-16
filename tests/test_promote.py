@@ -25,6 +25,7 @@ class StubLidarr:
         self.command_status = command_status
         self.commands = []
         self.track_file_calls = []
+        self.deleted_track_files = []
 
     def get_track_file(self, albumId=None, **kwargs):
         self.track_file_calls.append(albumId)
@@ -32,6 +33,10 @@ class StubLidarr:
             return []
         batch = self.trackfile_batches[0] if len(self.trackfile_batches) == 1 else self.trackfile_batches.pop(0)
         return [dict(file) for file in batch]
+
+    def delete_track_file(self, ids_):
+        self.deleted_track_files.append(list(ids_) if isinstance(ids_, list) else [ids_])
+        return {}
 
     def post_command(self, name=None, **kwargs):
         self.commands.append((name, kwargs))
@@ -240,12 +245,14 @@ def test_promote_verify_failure_leaves_folder_and_recycles_nothing(tmp_path):
     assert "no trackfiles" in reason
     assert (new_dir / "01.flac").exists()  # moved folder stays put for the next rescan
     assert not staged.exists()
-    assert old_dir.exists()
-    assert not recycle.exists()
+    # old copy was retired BEFORE the refresh; restorable from the recycle bin
+    assert not old_dir.exists()
+    recycled = list(recycle.rglob("01.flac"))
+    assert len(recycled) == 1
     assert logger.warnings
 
 
-def test_promote_old_folder_still_referenced_is_not_recycled(tmp_path):
+def test_promote_retires_old_copy_before_refresh(tmp_path):
     artist_dir = tmp_path / "music" / "Adele"
     artist_dir.mkdir(parents=True)
     old_dir = artist_dir / "Adele - 21 (2011) [WEB][FLAC]"
@@ -255,11 +262,18 @@ def test_promote_old_folder_still_referenced_is_not_recycled(tmp_path):
     name = "Adele - 21 (2011) [CD][FLAC 16bit]"
     new_dir = artist_dir / name
     recycle = tmp_path / "recycle"
-    lidarr = StubLidarr(
+
+    class OrderCheckingStub(StubLidarr):
+        def post_command(self, name=None, **kwargs):
+            # by refresh time the old copy must already be retired
+            assert not old_dir.exists()
+            assert self.deleted_track_files == [[41]]
+            return super().post_command(name=name, **kwargs)
+
+    lidarr = OrderCheckingStub(
         trackfile_batches=[
-            [{"path": str(old_dir / "01.flac")}],
-            # Verify finds the new folder mapped but a file still lives in the old one
-            [{"path": str(new_dir / "01.flac")}, {"path": str(old_dir / "02.flac")}],
+            [{"id": 41, "path": str(old_dir / "01.flac")}],
+            [{"id": 42, "path": str(new_dir / "01.flac")}],
         ]
     )
     promoter = Promoter(lidarr, RecordingLogger(), str(recycle))
@@ -267,8 +281,9 @@ def test_promote_old_folder_still_referenced_is_not_recycled(tmp_path):
     ok, _ = promoter.promote(make_album(artist_dir), str(staged), name)
 
     assert ok is True
-    assert old_dir.exists()
-    assert not recycle.exists()
+    assert not old_dir.exists()
+    assert len(list(recycle.rglob("01.flac"))) == 1
+    assert (new_dir / "01.flac").exists()
 
 
 def test_promote_creates_missing_artist_directory(tmp_path):
