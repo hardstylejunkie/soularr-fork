@@ -25,6 +25,7 @@ from soularr_fork import policy as fork_policy
 from soularr_fork import promote as fork_promote
 from soularr_fork.cfsweep import CfSweep
 from soularr_fork.dedup import SingleDedup
+from soularr_fork.orphans import OrphanSweep
 
 
 class EnvInterpolation(configparser.ExtendedInterpolation):
@@ -101,6 +102,10 @@ cf_artist_cursor_file_path = None
 promote_completed = None
 promote_verify_timeout = None
 recycle_bin = None
+orphan_sweep = None
+orphan_sweep_min_age = None
+orphan_sweep_max_attempts = None
+orphan_sweep_state_file_path = None
 
 # === Runtime State & Caches ===
 search_cache = {}
@@ -979,6 +984,62 @@ def promote_album(album_data, staged_dir):
         logger.exception(f"Promote failed for {album_data['artist']} - {album_data['title']}; folder left in staging")
 
 
+def orphan_tag_reader(path):
+    """music_tag artist/album reader for the orphan sweep; None on any failure."""
+    try:
+        song = music_tag.load_file(path)
+        return {"artist": str(song["artist"]), "album": str(song["album"])}
+    except Exception:
+        return None
+
+
+def slskd_active_download_folders():
+    """Leaf folder names slskd is still downloading into: the parent folder of
+    any file in the transfer list whose state is not Completed. Fail-open —
+    an API error means an empty set (age + completeness still guard the sweep)."""
+    active = set()
+    try:
+        downloads = slskd.transfers.get_all_downloads()
+    except Exception:
+        logger.warning("Orphan sweep: could not list active slskd downloads; assuming none")
+        return active
+    for user in downloads or []:
+        for directory in user.get("directories", []):
+            for file in directory.get("files", []):
+                if str(file.get("state", "")).startswith("Completed"):
+                    continue
+                filename = file.get("filename", "")
+                parent = filename.rsplit("\\", 1)[0] if "\\" in filename else directory.get("directory", "")
+                leaf = parent.rstrip("\\/").rsplit("\\", 1)[-1]
+                if leaf:
+                    active.add(leaf)
+    return active
+
+
+def run_orphan_sweep():
+    """Once-per-run startup sweep: promote completed downloads orphaned in the
+    staging dir by container restarts (promote only fires within the cycle that
+    grabbed the album). Fail-open: any error logs and the run continues."""
+    try:
+        promoter = fork_promote.Promoter(lidarr, logger, recycle_bin, verify_timeout=promote_verify_timeout)
+        outcomes = OrphanSweep(
+            lidarr=lidarr,
+            logger=logger,
+            staging_dir=slskd_download_dir,
+            promoter=promoter,
+            type_policy=type_policy,
+            tag_reader=orphan_tag_reader,
+            active_folders_fn=slskd_active_download_folders,
+            state_path=orphan_sweep_state_file_path,
+            min_age_minutes=orphan_sweep_min_age,
+            max_attempts=orphan_sweep_max_attempts,
+        ).sweep()
+        promoted = sum(1 for _, outcome in outcomes if outcome == "promoted")
+        logger.info(f"Orphan sweep finished: {len(outcomes)} folder(s) checked, {promoted} promoted")
+    except Exception:
+        logger.exception("Orphan sweep failed; continuing with the run")
+
+
 def process_completed_album(album_data, failed_grab):
     os.chdir(slskd_download_dir)
     if rename_download_folders is True:
@@ -1525,6 +1586,10 @@ def main():
         promote_completed, \
         promote_verify_timeout, \
         recycle_bin, \
+        orphan_sweep, \
+        orphan_sweep_min_age, \
+        orphan_sweep_max_attempts, \
+        orphan_sweep_state_file_path, \
         lidarr, \
         slskd, \
         config, \
@@ -1579,6 +1644,7 @@ def main():
     current_page_file_path = os.path.join(args.var_dir, ".current_page.txt")
     failed_import_denylist_file_path = os.path.join(args.var_dir, "failed_imports.json")
     staged_albums_file_path = os.path.join(args.var_dir, "staged_albums.json")
+    orphan_sweep_state_file_path = os.path.join(args.var_dir, "orphan_sweep.json")
     cf_artist_cursor_file_path = os.path.join(args.var_dir, ".cf_artist_cursor.txt")
 
     if not is_docker() and os.path.exists(lock_file_path) and args.lock_file:
@@ -1663,6 +1729,9 @@ def main():
         promote_completed = config.getboolean("Download Settings", "promote_completed", fallback=False)
         recycle_bin = config.get("Download Settings", "recycle_bin", fallback="/data/media/music/.RecycleBin")
         promote_verify_timeout = config.getint("Download Settings", "promote_verify_timeout", fallback=600)
+        orphan_sweep = config.getboolean("Download Settings", "orphan_sweep", fallback=False)
+        orphan_sweep_min_age = config.getint("Download Settings", "orphan_sweep_min_age", fallback=15)
+        orphan_sweep_max_attempts = config.getint("Download Settings", "orphan_sweep_max_attempts", fallback=4)
         cf_below_threshold = config.getint("Search Settings", "cf_below_threshold", fallback=0)
         cf_artists_per_run = config.getint("Search Settings", "cf_artists_per_run", fallback=10)
 
@@ -1698,6 +1767,10 @@ def main():
 
         slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         lidarr = LidarrAPI(lidarr_host_url, lidarr_api_key)
+
+        if promote_completed and orphan_sweep:
+            run_orphan_sweep()
+
         wanted_records = []
         try:
             for source in search_sources:

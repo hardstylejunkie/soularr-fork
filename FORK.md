@@ -156,6 +156,39 @@ Requirement: the download staging dir must live **outside** the Lidarr root
 folder — `RefreshArtist` rescans the root, and a staging dir inside it would
 get scanned mid-download.
 
+### Startup orphan sweep
+
+`[Download Settings]`
+
+- `orphan_sweep` — promote fires only within the cycle that grabbed the
+  album, so a container restart orphans completed downloads in the staging
+  dir forever. With this on (and `promote_completed` on), every script run
+  starts with one sweep over the staging dir's immediate subfolders. Off by
+  default.
+- `orphan_sweep_min_age` — minutes a folder must be untouched before it
+  counts as settled (default `15`).
+- `orphan_sweep_max_attempts` — attempts per folder before the sweep stops
+  retrying it (default `4`).
+
+Per folder the sweep: **identifies** the album (tags from the first audio
+file win, Lidarr-style parsing of the leaf folder name fills the gaps; tag
+artists with a featuring clause — `2Pac feat. Nate Dogg` — retry with the
+clause stripped), **matches** it to a Lidarr artist/album (exact-casefold
+names; on multiple title hits the album whose track count equals the
+folder's audio count, else the earliest release), checks **completeness**
+(folder audio count must equal the album's track count — a still-growing
+folder just retries later), applies the **same proof gate** as live grabs
+for proof-required types (log+cue or a matching FLAC scene name, lossless-
+only audio), and **promotes** through the regular flow under the composed
+token folder name.
+
+Folders that are hidden, younger than the age floor, or still appearing in
+slskd's active transfer list are skipped without counting an attempt.
+Attempts and outcomes persist in `orphan_sweep.json` in the var dir; hitting
+the attempt cap parks the folder for manual review instead of re-chewing it
+on every restart. Everything is fail-open: one bad folder logs its outcome
+and the sweep moves on.
+
 ## Homelab config example
 
 Albums FLAC-only with log+cue proof; EPs and singles FLAC falling back to
