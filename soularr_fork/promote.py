@@ -24,6 +24,7 @@ from datetime import datetime
 _INVALID_CHARS = re.compile(r'[<>:."/\\|?*]')
 
 _REFRESH_POLL_SECONDS = 2
+_VERIFY_POLL_SECONDS = 15
 
 
 def compose_folder_name(artist_name, album_title, year, disambiguation, medium, depth, has_proof, release_group):
@@ -121,11 +122,12 @@ class Promoter:
     for the scan to map. Old files stay restorable from the recycle bin.
     """
 
-    def __init__(self, lidarr, logger, recycle_bin, refresh_timeout=300):
+    def __init__(self, lidarr, logger, recycle_bin, refresh_timeout=300, verify_timeout=600):
         self.lidarr = lidarr
         self.logger = logger
         self.recycle_bin = recycle_bin
         self.refresh_timeout = refresh_timeout
+        self.verify_timeout = verify_timeout
 
     def promote(self, album_record, staged_dir, name):
         try:
@@ -163,18 +165,24 @@ class Promoter:
             self.logger.warning(f"RefreshArtist failed after moving {new_path}; folder left in place: {error}")
             return False, f"refresh failed: {error}"
 
-        try:
-            current = self.lidarr.get_track_file(albumId=album_id)
-        except Exception as error:
-            self.logger.warning(f"Could not verify promote of {new_path}; folder left in place: {error}")
-            return False, f"verify failed: {error}"
+        # The RefreshArtist COMMAND completes before its queued disk scan runs
+        # (Lidarr's command queue is serial and root scans stack up), so poll
+        # for the mapping instead of checking once.
+        deadline = time.time() + self.verify_timeout
+        while True:
+            try:
+                current = self.lidarr.get_track_file(albumId=album_id)
+                current_paths = [file.get("path") for file in current if file.get("path")]
+                if any(_inside(path, new_path) for path in current_paths):
+                    return True, new_path
+            except Exception as error:
+                self.logger.warning(f"Verify poll error for {new_path}: {error}")
+            if time.time() >= deadline:
+                break
+            time.sleep(_VERIFY_POLL_SECONDS)
 
-        current_paths = [file.get("path") for file in current if file.get("path")]
-        if not any(_inside(path, new_path) for path in current_paths):
-            self.logger.warning(f"Promote not verified: no trackfiles inside {new_path}; folder left in place for rescan (old copy restorable from {self.recycle_bin})")
-            return False, f"no trackfiles mapped inside {new_path}"
-
-        return True, new_path
+        self.logger.warning(f"Promote not verified after {self.verify_timeout}s: no trackfiles inside {new_path}; folder left in place — a later scan usually maps it (old copy restorable from {self.recycle_bin})")
+        return False, f"no trackfiles mapped inside {new_path}"
 
     def _trackfile_snapshot(self, album_id):
         """(folders, ids) of the album's current trackfiles; empty on error

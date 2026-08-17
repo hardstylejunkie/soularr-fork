@@ -184,7 +184,7 @@ def test_promote_success_moves_and_recycles_old_folder(tmp_path):
             [{"path": str(new_dir / "01.flac")}],
         ]
     )
-    promoter = Promoter(lidarr, RecordingLogger(), str(recycle))
+    promoter = Promoter(lidarr, RecordingLogger(), str(recycle), verify_timeout=0)
 
     ok, detail = promoter.promote(make_album(artist_dir), str(staged), name)
 
@@ -216,7 +216,7 @@ def test_promote_recycle_collision_prefixes_artist(tmp_path):
             [{"path": str(new_dir / "01.flac")}],
         ]
     )
-    promoter = Promoter(lidarr, RecordingLogger(), str(recycle))
+    promoter = Promoter(lidarr, RecordingLogger(), str(recycle), verify_timeout=0)
 
     ok, _ = promoter.promote(make_album(artist_dir), str(staged), name)
 
@@ -237,7 +237,7 @@ def test_promote_verify_failure_leaves_folder_and_recycles_nothing(tmp_path):
     # After refresh Lidarr still only knows the old folder: verify must fail
     lidarr = StubLidarr(trackfile_batches=[[{"path": str(old_dir / "01.flac")}]])
     logger = RecordingLogger()
-    promoter = Promoter(lidarr, logger, str(recycle))
+    promoter = Promoter(lidarr, logger, str(recycle), verify_timeout=0)
 
     ok, reason = promoter.promote(make_album(artist_dir), str(staged), name)
 
@@ -276,7 +276,7 @@ def test_promote_retires_old_copy_before_refresh(tmp_path):
             [{"id": 42, "path": str(new_dir / "01.flac")}],
         ]
     )
-    promoter = Promoter(lidarr, RecordingLogger(), str(recycle))
+    promoter = Promoter(lidarr, RecordingLogger(), str(recycle), verify_timeout=0)
 
     ok, _ = promoter.promote(make_album(artist_dir), str(staged), name)
 

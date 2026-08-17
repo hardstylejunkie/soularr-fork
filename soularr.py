@@ -99,6 +99,7 @@ cf_below_threshold = None
 cf_artists_per_run = None
 cf_artist_cursor_file_path = None
 promote_completed = None
+promote_verify_timeout = None
 recycle_bin = None
 
 # === Runtime State & Caches ===
@@ -966,7 +967,7 @@ def promote_album(album_data, staged_dir):
             has_proof=has_proof,
             release_group=parsed.release_group if parsed else None,
         )
-        promoter = fork_promote.Promoter(lidarr, logger, recycle_bin)
+        promoter = fork_promote.Promoter(lidarr, logger, recycle_bin, verify_timeout=promote_verify_timeout)
         promoted, detail = promoter.promote(album, staged_dir, name)
         if promoted:
             logger.info(f"Promoted {album_data['artist']} - {album_data['title']} -> {detail}")
@@ -1522,6 +1523,7 @@ def main():
         cf_artists_per_run, \
         cf_artist_cursor_file_path, \
         promote_completed, \
+        promote_verify_timeout, \
         recycle_bin, \
         lidarr, \
         slskd, \
@@ -1660,6 +1662,7 @@ def main():
         staged_memory_days = config.getint("Download Settings", "staged_memory_days", fallback=7)
         promote_completed = config.getboolean("Download Settings", "promote_completed", fallback=False)
         recycle_bin = config.get("Download Settings", "recycle_bin", fallback="/data/media/music/.RecycleBin")
+        promote_verify_timeout = config.getint("Download Settings", "promote_verify_timeout", fallback=600)
         cf_below_threshold = config.getint("Search Settings", "cf_below_threshold", fallback=0)
         cf_artists_per_run = config.getint("Search Settings", "cf_artists_per_run", fallback=10)
 
