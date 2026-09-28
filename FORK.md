@@ -134,9 +134,18 @@ library convention:
   Media`→`WEB`/`Vinyl`), falling back to the source parsed from the original
   slskd folder name, then CD/WEB by proof presence.
 - Depth is read from the first FLAC's STREAMINFO block (a bare `[FLAC]`
-  token when unreadable). `[LOG+CUE]` appears when the folder holds both a
-  `.log` and a `.cue`; the release group comes from parsing the original
-  slskd folder name.
+  token when unreadable). A folder with no FLAC gets the token of the audio
+  it really holds instead — `[MP3-320]` / `[MP3-VBR]` from the first MPEG
+  frame header (Lidarr's own `{Quality Depth}` spelling), or the upper-cased
+  extension for other codecs — so an `mp3 320` rung download is never
+  labelled `[FLAC]` (Lidarr's folder-parse custom formats would score it
+  Lossless; nine such promotes shipped before 2026-09-24). `[LOG+CUE]`
+  appears when the folder holds both a `.log` and a `.cue`; the release group
+  comes from parsing the original slskd folder name, and the parser drops
+  tokens that can never be a group: audio-spec fragments (`[16B-44100kHz]` →
+  `44100kHz`, mirroring lidarr-fork's `InvalidReleaseGroupRegex`), hex runs
+  from MusicBrainz ids in the folder name (`(9ca74894-…-70fcfe657896)`) and
+  edition words (`[Single]`, `[EP]`).
 
 Flow: **move → refresh → verify → recycle**. The staged folder is moved into
 the artist directory (created if missing) under the composed name, a

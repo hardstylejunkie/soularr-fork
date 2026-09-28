@@ -138,6 +138,7 @@ class OrphanSweep:
                 depth=fork_promote.flac_bit_depth(folder),
                 has_proof=has_proof,
                 release_group=parsed.release_group if parsed else None,
+                audio_format=fork_promote.audio_format_token(folder),
             )
             promoted, detail = self.promoter.promote(album, folder, name)
             if promoted:

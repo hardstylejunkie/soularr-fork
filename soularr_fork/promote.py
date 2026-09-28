@@ -27,19 +27,26 @@ _REFRESH_POLL_SECONDS = 2
 _VERIFY_POLL_SECONDS = 15
 
 
-def compose_folder_name(artist_name, album_title, year, disambiguation, medium, depth, has_proof, release_group):
+def compose_folder_name(artist_name, album_title, year, disambiguation, medium, depth, has_proof, release_group,
+                        audio_format="FLAC"):
     """Emit the library folder convention:
 
     {artist} - {title} ({year})[ [disambiguation]] [{medium}][FLAC {depth}bit][LOG+CUE][-GROUP]
 
     depth None/0 emits a bare [FLAC] token (real library folders without a
-    readable depth use that form). The finished name gets the same character
-    sanitation as soularr.py's sanitize_folder_name.
+    readable depth use that form). audio_format is the token for non-FLAC
+    payloads (audio_format_token(): 'MP3-320', 'MP3-VBR', 'M4A', ...) and
+    replaces the FLAC token verbatim -- an MP3 rung download must never be
+    labelled [FLAC], Lidarr's folder-parse custom formats would score it
+    Lossless. The finished name gets the same character sanitation as
+    soularr.py's sanitize_folder_name.
     """
     name = f"{artist_name} - {album_title} ({year})"
     if disambiguation:
         name += f" [{disambiguation}]"
-    if depth:
+    if audio_format and audio_format.upper() != "FLAC":
+        name += f" [{medium}][{audio_format}]"
+    elif depth:
         name += f" [{medium}][FLAC {depth}bit]"
     else:
         name += f" [{medium}][FLAC]"
@@ -81,6 +88,74 @@ def flac_bit_depth(folder_path):
             return (((info[12] & 1) << 4) | (info[13] >> 4)) + 1
     except Exception:
         return None
+
+
+_AUDIO_EXTENSIONS = (".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma", ".ape", ".wv", ".alac", ".aiff")
+# MPEG audio bitrate tables (kbps), Layer III: index 1..14 (0 = free, 15 = bad).
+_MP3_BITRATES_V1 = (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320)
+_MP3_BITRATES_V2 = (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160)
+
+
+def mp3_format_token(path):
+    """'MP3-320' / 'MP3-VBR' / 'MP3-<kbps>' from the first MPEG frame header
+    (after any ID3v2 tag); 'MP3' when no frame is readable. A Xing header on
+    the first frame means VBR (a LAME 'Info' header is CBR)."""
+    try:
+        with open(path, "rb") as handle:
+            _skip_id3(handle)
+            data = handle.read(65536)
+    except Exception:
+        return "MP3"
+    for i in range(len(data) - 4):
+        b1, b2, b3, b4 = data[i], data[i + 1], data[i + 2], data[i + 3]
+        if b1 != 0xFF or (b2 & 0xE0) != 0xE0:
+            continue
+        version = (b2 >> 3) & 0x3      # 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5, 1 = reserved
+        layer = (b2 >> 1) & 0x3        # 1 = Layer III
+        bitrate_index = (b3 >> 4) & 0xF
+        sample_index = (b3 >> 2) & 0x3
+        if version == 1 or layer != 1 or bitrate_index in (0, 15) or sample_index == 3:
+            continue
+        table = _MP3_BITRATES_V1 if version == 3 else _MP3_BITRATES_V2
+        kbps = table[bitrate_index]
+        mono = ((b4 >> 6) & 0x3) == 3
+        side_info = (17 if mono else 32) if version == 3 else (9 if mono else 17)
+        tag = data[i + 4 + side_info:i + 4 + side_info + 4]
+        if tag == b"Xing":
+            return "MP3-VBR"
+        return f"MP3-{kbps}" if kbps else "MP3"
+    return "MP3"
+
+
+def audio_format_token(folder_path):
+    """Folder-name format token for the audio actually inside folder_path:
+    'FLAC' when any .flac is present (depth comes from flac_bit_depth), else
+    mp3_format_token() for MP3, else the upper-cased extension of the first
+    other audio file. Falls back to 'FLAC' (the legacy behaviour) when no
+    audio file is found at all."""
+    try:
+        entries = sorted(os.listdir(folder_path))
+    except Exception:
+        return "FLAC"
+    audio = [os.path.join(folder_path, entry) for entry in entries if entry.lower().endswith(_AUDIO_EXTENSIONS)]
+    if not audio:
+        # multi-disc layout: audio one level down (CD1/, Disc 2/ ...)
+        for entry in entries:
+            sub = os.path.join(folder_path, entry)
+            if os.path.isdir(sub):
+                try:
+                    audio.extend(os.path.join(sub, leaf) for leaf in sorted(os.listdir(sub))
+                                 if leaf.lower().endswith(_AUDIO_EXTENSIONS))
+                except Exception:
+                    continue
+    if not audio:
+        return "FLAC"
+    if any(path.lower().endswith(".flac") for path in audio):
+        return "FLAC"
+    mp3s = [path for path in audio if path.lower().endswith(".mp3")]
+    if mp3s:
+        return mp3_format_token(mp3s[0])
+    return os.path.splitext(audio[0])[1].lstrip(".").upper()
 
 
 def medium_from_release(release, parsed_source, has_proof=False):

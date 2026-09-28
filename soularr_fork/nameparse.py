@@ -177,6 +177,28 @@ _RELEASE_GROUP = re.compile(
 
 _RELEASE_GROUP_STOP_TOKENS = ("MP3", "ALAC", "FLAC", "WEB")
 
+# Fork: tokens the dash rule captures that can never be a release group.
+# Audio-spec fragments mirror lidarr-fork Parser.cs InvalidReleaseGroupRegex
+# ('[16B-44100kHz]' -> '44100kHz'); hex runs are MusicBrainz/tagger ids
+# ('All In (9ca74894-e54b-4fb6-b117-70fcfe657896)' -> '70fcfe657896');
+# edition words come from '[Single]'-style suffixes. A bogus group would be
+# stamped on the promoted folder as '-GROUP' and game the release-group
+# custom formats.
+_INVALID_RELEASE_GROUP = re.compile(r"^\d*(?:bits?|khz|hz|kbps|bps)$", re.IGNORECASE)
+_HEX_RUN_RELEASE_GROUP = re.compile(r"^[0-9a-f]{8,}$", re.IGNORECASE)
+_EDITION_WORD_RELEASE_GROUPS = frozenset((
+    "single", "ep", "lp", "album", "ost", "soundtrack", "remix", "remixes", "remaster", "remastered",
+    "deluxe", "explicit", "clean", "live", "demo", "demos", "promo", "bootleg", "mono", "stereo",
+    "reissue", "compilation", "mixtape", "instrumental", "instrumentals", "acoustic", "edit", "edits",
+))
+
+
+def _is_junk_release_group(group):
+    return (group.isdigit()
+            or _INVALID_RELEASE_GROUP.match(group) is not None
+            or _HEX_RUN_RELEASE_GROUP.match(group) is not None
+            or group.lower() in _EDITION_WORD_RELEASE_GROUPS)
+
 
 def _parse_release_group(title):
     text = _CLEAN_RELEASE_GROUP.sub("", title.strip())
@@ -191,8 +213,9 @@ def _parse_release_group(title):
         if text[:end].upper().endswith(_RELEASE_GROUP_STOP_TOKENS):
             continue
         last = group
-    # Parser.cs rejects a purely numeric final match (year/bitrate fragments).
-    if last is None or last.isdigit():
+    # Parser.cs rejects a purely numeric final match (year/bitrate fragments);
+    # the fork also drops audio-spec, hex-id and edition-word tokens.
+    if last is None or _is_junk_release_group(last):
         return None
     return last
 

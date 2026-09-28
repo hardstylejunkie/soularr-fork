@@ -291,3 +291,40 @@ class TestSanitizeSearchQuery:
     ])
     def test_queries(self, query, expected):
         assert sanitize_search_query(query) == expected
+
+
+class TestJunkReleaseGroups:
+    """Tokens the dash/bracket rules capture that are not release groups; a
+    bogus group is stamped on promoted folders as '-GROUP' (2026-09-24)."""
+
+    def test_audio_spec_fragment_is_not_a_group(self):
+        # promoted as '... [WEB][FLAC 16bit]-44100kHz' on 2026-09-23
+        check("American Authors - Best Night of My Life (2023) [FLAC] [16B-44100kHz]", {
+            "artist": "American Authors", "album": "Best Night of My Life",
+            "codec": "FLAC", "release_group": None,
+        })
+
+    @pytest.mark.parametrize("name", [
+        "music\\Led Zeppelin\\This Is Led Zeppelin (ffeb9258-4101-360b-8a84-69b2b1a10c22)",
+        "All In (9ca74894-e54b-4fb6-b117-70fcfe657896)",
+        "Lifehouse - All In (2012) [CD][FLAC]-70fcfe657896",
+    ])
+    def test_musicbrainz_id_hex_run_is_not_a_group(self, name):
+        from soularr_fork.nameparse import _parse_release_group
+        assert _parse_release_group(name) is None
+
+    def test_edition_word_suffix_is_not_a_group(self):
+        # promoted as '... [WEB][FLAC]-Single' on 2026-09-23
+        from soularr_fork.nameparse import _parse_release_group
+        assert _parse_release_group("2014 - Summertime Sadness (Monsieur Adi Remix) [Single]") is None
+        assert _parse_release_group("Artist - Title (2010) [EP]") is None
+
+    @pytest.mark.parametrize("name, group", [
+        ("Styx-20th_Century_Masters_The_Millennium_Collection-CD-FLAC-2002-PERFECT", "PERFECT"),
+        ("Little_Big_Town-From_LBT_With_Love-EP-WEB-FLAC-2026-GROUP", "GROUP"),
+        ("Kenny_Chesney-Silver_Sands_Marina-16BIT-WEB-FLAC-2026-ENRiCH", "ENRiCH"),
+        ("Coldplay_-_ALL_MY_LOVE_(PNAU_X_Coldplay)-SINGLE-WEB-2024-B580", "B580"),
+    ])
+    def test_real_groups_still_parse(self, name, group):
+        from soularr_fork.nameparse import _parse_release_group
+        assert _parse_release_group(name) == group

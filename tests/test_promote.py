@@ -336,3 +336,94 @@ def test_promote_existing_destination_leaves_staged_folder(tmp_path):
     assert "destination exists" in reason
     assert (staged / "01.flac").exists()  # nothing was moved
     assert lidarr.commands == []
+
+
+# --- audio_format_token / compose with non-FLAC payloads (2026-09-24) -------
+
+from soularr_fork.promote import audio_format_token, mp3_format_token
+
+
+def mp3_frame(bitrate_index=14, version_bits=3, mono=False, xing=False, id3=False):
+    """One MPEG Layer III frame header (+ side info + optional Xing tag)."""
+    b2 = 0xE0 | (version_bits << 3) | (1 << 1)          # sync tail, version, layer III
+    b3 = (bitrate_index << 4) | (0 << 2)                  # bitrate index, 44.1 kHz
+    b4 = (0x3 << 6) if mono else (0x0 << 6)               # channel mode
+    side = (17 if mono else 32) if version_bits == 3 else (9 if mono else 17)
+    frame = bytes([0xFF, b2, b3, b4]) + b"\x00" * side + (b"Xing" if xing else b"Info") + b"\x00" * 64
+    if id3:
+        frame = b"ID3\x04\x00\x00\x00\x00\x00\x0a" + b"\x00" * 10 + frame
+    return frame
+
+
+def test_mp3_format_token_cbr_320(tmp_path):
+    path = tmp_path / "01 - Song.mp3"
+    path.write_bytes(mp3_frame())
+    assert mp3_format_token(str(path)) == "MP3-320"
+
+
+def test_mp3_format_token_skips_id3_and_reads_mpeg2_table(tmp_path):
+    path = tmp_path / "01 - Song.mp3"
+    path.write_bytes(mp3_frame(bitrate_index=13, version_bits=2, mono=True, id3=True))
+    assert mp3_format_token(str(path)) == "MP3-144"
+
+
+def test_mp3_format_token_xing_means_vbr(tmp_path):
+    path = tmp_path / "01 - Song.mp3"
+    path.write_bytes(mp3_frame(bitrate_index=9, xing=True))
+    assert mp3_format_token(str(path)) == "MP3-VBR"
+
+
+def test_mp3_format_token_unreadable_is_bare_mp3(tmp_path):
+    path = tmp_path / "01 - Song.mp3"
+    path.write_bytes(b"\x00" * 100)
+    assert mp3_format_token(str(path)) == "MP3"
+
+
+def test_audio_format_token_prefers_flac(tmp_path):
+    (tmp_path / "01.flac").write_bytes(b"fLaC")
+    (tmp_path / "02.mp3").write_bytes(mp3_frame())
+    assert audio_format_token(str(tmp_path)) == "FLAC"
+
+
+def test_audio_format_token_mp3_folder(tmp_path):
+    (tmp_path / "Lifehouse_All In_01_All In.mp3").write_bytes(mp3_frame())
+    (tmp_path / "folder.jpg").write_bytes(b"jpg")
+    assert audio_format_token(str(tmp_path)) == "MP3-320"
+
+
+def test_audio_format_token_other_lossy_uses_extension(tmp_path):
+    (tmp_path / "01 - Song.m4a").write_bytes(b"\x00" * 16)
+    assert audio_format_token(str(tmp_path)) == "M4A"
+
+
+def test_audio_format_token_no_audio_keeps_legacy_flac(tmp_path):
+    (tmp_path / "cover.jpg").write_bytes(b"jpg")
+    assert audio_format_token(str(tmp_path)) == "FLAC"
+    assert audio_format_token(str(tmp_path / "missing")) == "FLAC"
+
+
+def test_compose_mp3_payload_never_says_flac():
+    # Lifehouse - All In (2012) was an MP3 single promoted as [CD][FLAC]; the
+    # folder-parse custom formats then scored it Lossless.
+    assert (
+        compose_folder_name("Lifehouse", "All In", 2012, None, "CD", None, False, None, audio_format="MP3-320")
+        == "Lifehouse - All In (2012) [CD][MP3-320]"
+    )
+
+
+def test_compose_non_flac_ignores_depth_and_keeps_proof_and_group():
+    assert (
+        compose_folder_name("Adele", "21", 2011, None, "WEB", 16, True, "GROUP", audio_format="MP3-VBR")
+        == "Adele - 21 (2011) [WEB][MP3-VBR][LOG+CUE]-GROUP"
+    )
+
+
+def test_compose_flac_default_unchanged():
+    assert compose_folder_name("Adele", "21", 2011, None, "CD", 16, False, None, audio_format="FLAC") == "Adele - 21 (2011) [CD][FLAC 16bit]"
+
+
+def test_audio_format_token_looks_one_level_down_for_multi_disc(tmp_path):
+    (tmp_path / "CD1").mkdir()
+    (tmp_path / "CD1" / "01 - Song.mp3").write_bytes(mp3_frame())
+    (tmp_path / "cover.jpg").write_bytes(b"jpg")
+    assert audio_format_token(str(tmp_path)) == "MP3-320"

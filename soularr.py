@@ -971,6 +971,7 @@ def promote_album(album_data, staged_dir):
             depth=fork_promote.flac_bit_depth(staged_dir),
             has_proof=has_proof,
             release_group=parsed.release_group if parsed else None,
+            audio_format=fork_promote.audio_format_token(staged_dir),
         )
         promoter = fork_promote.Promoter(lidarr, logger, recycle_bin, verify_timeout=promote_verify_timeout)
         promoted, detail = promoter.promote(album, staged_dir, name)
