@@ -23,6 +23,7 @@ from soularr_fork import nameparse as fork_nameparse
 from soularr_fork import normalize as fork_normalize
 from soularr_fork import policy as fork_policy
 from soularr_fork import promote as fork_promote
+from soularr_fork import queries as fork_queries
 from soularr_fork.cfsweep import CfSweep
 from soularr_fork.dedup import SingleDedup
 from soularr_fork.orphans import OrphanSweep
@@ -93,6 +94,9 @@ search_blacklist = []
 type_policy = None
 skip_singles_on_albums = None
 sanitize_search_queries = None
+title_only_fallback = None
+search_response_limit = 100
+search_file_limit = 10000
 skip_already_staged = None
 staged_memory_days = None
 staged_albums_file_path = None
@@ -531,6 +535,8 @@ def execute_search(query):
             filterResponses=True,
             maximumPeerQueueLength=config.getint("Search Settings", "maximum_peer_queue", fallback=50),
             minimumPeerUploadSpeed=config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
+            responseLimit=search_response_limit,
+            fileLimit=search_file_limit,
         )
     except Exception:
         logger.exception(f"Failed to perform search via SLSKD: {query}")
@@ -543,7 +549,8 @@ def execute_search(query):
         if slskd.searches.state(search["id"], False)["state"] != "InProgress":  # Added False here as we don't want the search results here. Just the state.
             break
         time.sleep(1)
-        if (time.time() - start_time) > config.getint("Search Settings", "search_timeout", fallback=5000):
+        # Fork: search_timeout is milliseconds; comparing it to elapsed seconds waited 83 min on a search slskd never closed
+        if (time.time() - start_time) > fork_queries.poll_deadline(config.getint("Search Settings", "search_timeout", fallback=5000)):
             logger.error("Failed to perform search via SLSKD due to timeout on search results.")
             return None
 
@@ -558,45 +565,23 @@ def search_for_album(album):
     album_title = album["title"]
     artist_name = album["artist"]["artistName"]
     album_id = album["id"]
-    if len(album_title) == 1:  # Need to add some code to wrangle specific artist names in here.. ;)
-        query = artist_name + " " + album_title
-    else:
-        query = artist_name + " " + album_title if config.getboolean("Search Settings", "album_prepend_artist", fallback=False) else album_title
-
-    original_query = query
-    for word in search_blacklist:
-        if word:
-            # Case-insensitive replacement
-            pattern = re.compile(re.escape(word), re.IGNORECASE)
-            query = pattern.sub("", query)
-
-    # Clean up double spaces
-    query = " ".join(query.split())
-
-    if query != original_query:
-        logger.info(f"Filtered search query: '{original_query}' -> '{query}'")
-
-    raw_query = query
-    if sanitize_search_queries:
-        # An empty or unchanged sanitized query means there is nothing to gain
-        # from a sanitized attempt (searching '' errors out) — search raw once.
-        sanitized_query = fork_nameparse.sanitize_search_query(raw_query)
-        if sanitized_query and sanitized_query != raw_query:
-            logger.info(f"Sanitized search query: '{raw_query}' -> '{sanitized_query}'")
-            query = sanitized_query
-
-    logger.info(f"Searching for album: {query}")
-    search_results = execute_search(query)
-    if not search_results and query != raw_query:
-        # Sanitized attempt failed (None) or returned nothing ([]) — retry raw once
-        logger.info(f"No results for sanitized query. Retrying with raw query: {raw_query}")
-        if minimum_search_interval > 0:
-            time.sleep(minimum_search_interval)
-        search_results = execute_search(raw_query)
-    if search_results is None:
-        return False
-
-    if not len(search_results) > 0:
+    # Fork: artist + title first, bare title only when that finds nobody (soularr_fork/queries.py)
+    ladder = fork_queries.build_query_ladder(
+        artist_name,
+        album_title,
+        prepend_artist=config.getboolean("Search Settings", "album_prepend_artist", fallback=False),
+        title_fallback=title_only_fallback,
+        sanitize=sanitize_search_queries,
+        blacklist=search_blacklist,
+        various=fork_queries.is_various_artists(album["artist"]),
+    )
+    search_results, _ = fork_queries.run_ladder(
+        ladder,
+        execute_search,
+        pause=(lambda: time.sleep(minimum_search_interval)) if minimum_search_interval > 0 else None,
+        log=logger.info,
+    )
+    if not search_results:
         return False
 
     if album_id not in search_cache:
@@ -1578,6 +1563,9 @@ def main():
         type_policy, \
         skip_singles_on_albums, \
         sanitize_search_queries, \
+        title_only_fallback, \
+        search_response_limit, \
+        search_file_limit, \
         skip_already_staged, \
         staged_memory_days, \
         staged_albums_file_path, \
@@ -1725,6 +1713,10 @@ def main():
         # Fork settings: fallbacks keep a stock upstream config behaving identically
         skip_singles_on_albums = config.getboolean("Search Settings", "skip_singles_on_albums", fallback=False)
         sanitize_search_queries = config.getboolean("Search Settings", "sanitize_search_queries", fallback=False)
+        title_only_fallback = config.getboolean("Search Settings", "title_only_fallback", fallback=False)
+        # slskd closes a search at response_limit PEERS or file_limit files; the fallbacks are slskd-api's own defaults
+        search_response_limit = fork_queries.positive_limit(config.get("Search Settings", "response_limit", fallback=""), 100, "response_limit", logger)
+        search_file_limit = fork_queries.positive_limit(config.get("Search Settings", "file_limit", fallback=""), 10000, "file_limit", logger)
         skip_already_staged = config.getboolean("Download Settings", "skip_already_staged", fallback=False)
         staged_memory_days = config.getint("Download Settings", "staged_memory_days", fallback=7)
         promote_completed = config.getboolean("Download Settings", "promote_completed", fallback=False)

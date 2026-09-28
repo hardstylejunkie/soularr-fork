@@ -69,6 +69,43 @@ All keys live in `config.ini`. New logic sits in the `soularr_fork/` package
   that breaks Soulseek searches; if the sanitized query errors or returns
   nothing, the raw query is retried once. Off by default.
 
+### Artist-first searches + search caps
+
+`[Search Settings]`
+
+A Soulseek search matches when every query word appears in a peer's file
+path, and slskd closes a search at `response_limit` **peers** (one response =
+one peer with all of its matching files), first come first served. Upstream
+searches the bare album title, so "Icon" or "Greatest Hits" fills the cap
+with other artists' folders. Measured on the homelab library (2026-09-28):
+58 % of searches hit the 100-peer cap, the median capped search had 5 of 100
+responders holding the wanted artist at all, and artist + title found FLAC
+sources for 12 of 12 albums the bare title had missed.
+
+- `album_prepend_artist` (upstream key) — search `artist title` instead of
+  the bare title. The fork skips the prefix where it can only hurt: Lidarr's
+  Various Artists entry, and titles that already spell the artist out
+  (self-titled albums, "The Best of Toby Keith").
+- `title_only_fallback` — when the artist + title query returns nobody
+  (artist spelled differently in shares, phrases the Soulseek server refuses
+  to search), retry with the bare title. Responses that merely fail to match
+  do **not** trigger it: the peers holding the artist were already seen and a
+  bare-title search would only add other artists. Off by default.
+- `response_limit` / `file_limit` — slskd's per-search caps. Defaults `100` /
+  `10000` are the `slskd-api` wrapper's own, which is what upstream runs
+  with. Raising `response_limit` is cheap once queries name the artist;
+  raising it for bare-title searches mostly adds folders to probe.
+
+Attempts run in order until one returns responses, `minimum_search_interval`
+apart: sanitized artist + title, raw artist + title, sanitized title, raw
+title (sanitized forms only with `sanitize_search_queries`, duplicates
+dropped). Logic and tests: `soularr_fork/queries.py`, `tests/test_queries.py`.
+
+Also fixed here: upstream compares `search_timeout` (milliseconds) with
+elapsed **seconds** while polling for a search to close, so one search slskd
+never closes stalls the run for 83 minutes (seen 2026-09-27 and 09-28). The
+fork polls for `search_timeout` + 60 s, then gives up on that attempt.
+
 ### Wanted-list processing order
 
 `[Search Settings]`
@@ -214,6 +251,9 @@ proof_files = log,cue
 max_directory_probes = 30
 skip_singles_on_albums = True
 sanitize_search_queries = True
+album_prepend_artist = True
+title_only_fallback = True
+response_limit = 250
 search_sort_key = artists.sortname
 
 [Download Settings]
