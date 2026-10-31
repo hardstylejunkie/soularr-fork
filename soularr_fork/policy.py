@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 
 from .nameparse import parse_folder_name
@@ -35,11 +36,15 @@ def file_ext(filename):
 
 
 def parse_ladder(raw):
-    # Same parse as upstream allowed_filetypes: bare split, no stripping, so
-    # attribute entries like "flac 16/44.1" survive intact.
+    # Same normalization as upstream's allowed_filetypes (split_config_list +
+    # lower): entries trimmed, inner whitespace collapsed, lowercased, empty
+    # entries dropped. Attribute entries like "flac 16/44.1" survive intact, and
+    # per-type ladders use the same strings as the base list that keys the
+    # search cache.
     if raw is None or not raw.strip():
         return None
-    return raw.split(",") if "," in raw else [raw]
+    entries = [" ".join(entry.split()).lower() for entry in raw.split(",")]
+    return [entry for entry in entries if entry] or None
 
 
 def parse_name_set(raw):
@@ -214,3 +219,33 @@ def is_staged(file_path, album_id, max_age_days):
     except ValueError:
         return False
     return datetime.now() - staged_at <= timedelta(days=max_age_days)
+
+
+# slskd never overwrites a finished download: when <folder>/<name> is taken it
+# saves the new file as <stem>_<DateTime.Ticks><ext> (18-19 digits).
+_TICK_SUFFIX_DIGITS = 15
+
+
+def resolve_download_copy(folder, name):
+    """Path of the most recent slskd copy of `name` in `folder`: the plain name
+    or one of its tick-suffixed collision copies, whichever was written last
+    (mtime, then the tick value). Returns the plain path when nothing exists
+    yet, so callers waiting for slskd's move keep waiting on the usual path."""
+    plain = os.path.join(folder, name)
+    stem, ext = os.path.splitext(name)
+    pattern = re.compile(re.escape(stem) + r"_(\d{%d,})" % _TICK_SUFFIX_DIGITS + re.escape(ext) + r"$")
+    candidates = []
+    if os.path.isfile(plain):
+        candidates.append((os.path.getmtime(plain), 0, plain))
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        entries = []
+    for entry in entries:
+        match = pattern.match(entry)
+        path = os.path.join(folder, entry)
+        if match and os.path.isfile(path):
+            candidates.append((os.path.getmtime(path), int(match.group(1)), path))
+    if not candidates:
+        return plain
+    return max(candidates)[2]

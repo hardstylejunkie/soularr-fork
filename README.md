@@ -209,6 +209,7 @@ skip_region_check = False
 accepted_formats = CD,Digital Media,Vinyl
 
 [Search Settings]
+# Search timeout (milliseconds)
 search_timeout = 5000
 maximum_peer_queue = 50
 # Minimum upload speed (bits/sec)
@@ -217,6 +218,9 @@ minimum_peer_upload_speed = 0
 minimum_filename_match_ratio = 0.8
 # Minimum time (seconds) between searches. Set to 0 to disable.
 minimum_search_interval = 5
+# Wait this many hours before searching again for an album that wasn't found or failed to download.
+# Attempts are tracked in search_attempts.json in the data directory. 0 = search every run (default).
+search_retry_wait_hours = 0
 # Preferred file types and qualities (most to least preferred)
 # Use "flac" or "mp3" to ignore quality details
 allowed_filetypes = flac 24/192,flac 16/44.1,flac,mp3 320,mp3
@@ -236,6 +240,12 @@ search_blacklist = WordToStripFromSearch1,WordToStripFromSearch2
 search_source = missing
 # Skip re-downloading albums that previously failed to import into Lidarr
 failed_import_denylist = True
+# Skip users whose downloads failed (timed out, errored or were rejected) on later runs, so a
+# different user is tried instead of the same one every time. Users are stored in failed_users.json
+# in the data directory (/data in Docker), next to failed_imports.json. Delete an entry (or the file) to clear it.
+ignore_failed_users = False
+# How long a failed user is skipped for, in hours. 0 = until removed from failed_users.json
+failed_user_ignore_hours = 168
 
 [Download Settings]
 download_filtering = True

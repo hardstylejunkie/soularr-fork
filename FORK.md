@@ -308,6 +308,28 @@ CI (`.github/workflows/fork-build.yml`) merges `mrusse/soularr` `main` into
 are resolved by hand. Every push/merge runs the test suite, then builds and
 pushes `ghcr.io/hardstylejunkie/soularr-fork:latest` and `:run-<n>`.
 
+**2026-10-31 hand merge** (the weekly sync had failed since 2026-10-12 on
+conflicts in `config.ini` and `soularr.py`; until then upstream had nothing
+new since the fork point `0700090`): upstream through `33116da` — Lidarr
+connection errors (`LIDARR_CONNECTION_ERRORS`), enqueues slskd does not
+report back count as failed, two infinite waits in download/import
+monitoring, wait for slskd to move finished files, damaged
+`.current_page.txt`, case/space-tolerant config lists, 10+ disc formats,
+and the opt-in `search_retry_wait_hours` / `ignore_failed_users` (both off
+by default). Resolution keeps the fork's structure: `execute_search` +
+`poll_deadline` (upstream fixed the same 83-min stall), `iter_candidates`
+with upstream's `is_skipped_user` check added, `get_records(source)`.
+Two follow-ups made in the merge:
+- per-type ladders are normalized like upstream's `allowed_filetypes`
+  (trimmed, lowercased) so they key the same search-cache entries;
+- `downloaded_file_path` takes the newest of the plain name and slskd's
+  `<stem>_<ticks><ext>` collision copies — upstream's wait-for-move would
+  otherwise hold the run to `stalled_timeout` (1 h) for such albums, and the
+  import would move a stale namesake or fail.
+Upstream deleted its tests directory (`86f5c54`); its 70 tests from
+`86f5c54^` pass against the merge with only the fork's call signatures
+adapted (`get_records("missing")`, `check_for_match(..., gate)`).
+
 ## Compatibility
 
 A config.ini without any fork keys behaves identically to upstream: every

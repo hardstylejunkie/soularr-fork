@@ -287,6 +287,20 @@ class TestSceneAcceptConfig:
         assert policy.TypePolicy(config).scene_accept is False
 
 
+class TestParseLadder:
+    def test_attribute_entries_survive(self):
+        assert policy.parse_ladder("flac 16/44.1,flac 24/192,flac,mp3 320") == ["flac 16/44.1", "flac 24/192", "flac", "mp3 320"]
+
+    def test_normalized_like_upstream_allowed_filetypes(self):
+        # upstream lowercases + trims allowed_filetypes; per-type ladders must produce the same strings
+        assert policy.parse_ladder(" FLAC  16/44.1 , flac,, MP3 320 ") == ["flac 16/44.1", "flac", "mp3 320"]
+
+    def test_empty(self):
+        assert policy.parse_ladder("") is None
+        assert policy.parse_ladder(None) is None
+        assert policy.parse_ladder(" , ") is None
+
+
 class TestParseSearchSources:
     def test_single_source(self):
         assert policy.parse_search_sources("missing") == ["missing"]
@@ -324,3 +338,52 @@ class TestDedupeRecords:
 
     def test_empty(self):
         assert policy.dedupe_records([]) == []
+
+
+class TestResolveDownloadCopy:
+    def _write(self, path, mtime):
+        path.write_bytes(b"x")
+        import os
+        os.utime(path, (mtime, mtime))
+        return str(path)
+
+    def test_plain_only(self, tmp_path):
+        plain = self._write(tmp_path / "01 Song.flac", 1000)
+        assert policy.resolve_download_copy(str(tmp_path), "01 Song.flac") == plain
+
+    def test_missing_returns_plain_path(self, tmp_path):
+        assert policy.resolve_download_copy(str(tmp_path), "01 Song.flac") == str(tmp_path / "01 Song.flac")
+
+    def test_missing_folder_returns_plain_path(self, tmp_path):
+        folder = str(tmp_path / "nope")
+        assert policy.resolve_download_copy(folder, "a.flac") == str(tmp_path / "nope" / "a.flac")
+
+    def test_collision_copy_newer_than_stale_plain(self, tmp_path):
+        self._write(tmp_path / "01 Song.flac", 1000)
+        fresh = self._write(tmp_path / "01 Song_639235697567966345.flac", 2000)
+        assert policy.resolve_download_copy(str(tmp_path), "01 Song.flac") == fresh
+
+    def test_only_collision_copy(self, tmp_path):
+        fresh = self._write(tmp_path / "01 Song_639235697567966345.flac", 2000)
+        assert policy.resolve_download_copy(str(tmp_path), "01 Song.flac") == fresh
+
+    def test_plain_newer_than_old_collision_copy(self, tmp_path):
+        self._write(tmp_path / "01 Song_639235697567966345.flac", 1000)
+        plain = self._write(tmp_path / "01 Song.flac", 2000)
+        assert policy.resolve_download_copy(str(tmp_path), "01 Song.flac") == plain
+
+    def test_same_mtime_highest_ticks_wins(self, tmp_path):
+        self._write(tmp_path / "a_639235697567966345.flac", 1000)
+        newest = self._write(tmp_path / "a_639246212892940708.flac", 1000)
+        assert policy.resolve_download_copy(str(tmp_path), "a.flac") == newest
+
+    def test_other_files_and_short_suffixes_ignored(self, tmp_path):
+        plain = self._write(tmp_path / "01 Song.flac", 1000)
+        self._write(tmp_path / "01 Song_2.flac", 3000)          # not a tick suffix
+        self._write(tmp_path / "01 Song_639235697567966345.lrc", 3000)  # other extension
+        self._write(tmp_path / "02 Other_639235697567966345.flac", 3000)
+        assert policy.resolve_download_copy(str(tmp_path), "01 Song.flac") == plain
+
+    def test_regex_characters_in_name(self, tmp_path):
+        fresh = self._write(tmp_path / "01 (Live) [x]+_639235697567966345.flac", 2000)
+        assert policy.resolve_download_copy(str(tmp_path), "01 (Live) [x]+.flac") == fresh
