@@ -144,6 +144,40 @@ With `disable_sync = True` the replacement lands in the staging folder for
 manual import — deliberate: replacing existing files goes through your
 review, not an automatic import. (Unless promote is on — see below.)
 
+### New releases first (recent)
+
+`[Search Settings]`
+
+Add `recent` to `search_source` (e.g. `recent,missing,cf_below`) to search
+the newest missing releases every run, ahead of the paging lap. Lidarr's
+indexers rarely carry new singles/EPs, and with an artist-sorted lap of
+~28k wanted albums a single released after the cursor passed its artist
+waits weeks for its turn. The source reads `wanted/missing` sorted by
+release date (newest first) and stops paging at the window edge; each
+pick then goes through the same queue filter, type policy, F4 dedup,
+staged dedup, ladders and gates as any other wanted album.
+
+- `recent_days` — window in whole days (default `60`; `0` turns the
+  source off). Lidarr leaves future releases out of the missing list.
+- `recent_album_types` — Lidarr types to take (default `Single,EP`; set it
+  empty to take every type — Albums still need the proof gate).
+- `recent_per_run` — albums per run (default `5`; `0` turns it off).
+- `recent_retry_hours` — a searched album is searched again only after
+  this many hours (default `24`), so a release that is not on Soulseek yet
+  is retried daily until it shows up or leaves the window. Never-searched
+  albums go first (newest release first), then the longest-waiting. State:
+  `recent_searched.json` in the var dir (album id -> last pick), pruned of
+  albums that left the window or stopped being missing.
+
+An album returned by two sources in one run (a new single that is also on
+the current `missing` page) is searched once. List `recent` first so new
+releases get the run's first searches.
+
+Deploy order: image first, config second — an older build does not know
+`recent` and would treat the unknown source as `cutoff_unmet`.
+
+Logic and tests: `soularr_fork/recent.py`, `tests/test_recent.py`.
+
 ### Promote (auto-import, token naming)
 
 `[Download Settings]`
@@ -252,9 +286,14 @@ max_directory_probes = 30
 skip_singles_on_albums = True
 sanitize_search_queries = True
 album_prepend_artist = True
-title_only_fallback = True
+title_only_fallback = False
 response_limit = 250
 search_sort_key = artists.sortname
+search_source = recent,missing,cf_below
+recent_days = 60
+recent_album_types = Single,EP,Album
+recent_per_run = 5
+recent_retry_hours = 12
 
 [Download Settings]
 skip_already_staged = True

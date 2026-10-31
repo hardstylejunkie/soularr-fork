@@ -27,6 +27,7 @@ from soularr_fork import queries as fork_queries
 from soularr_fork.cfsweep import CfSweep
 from soularr_fork.dedup import SingleDedup
 from soularr_fork.orphans import OrphanSweep
+from soularr_fork.recent import RecentSweep
 
 
 class EnvInterpolation(configparser.ExtendedInterpolation):
@@ -103,6 +104,11 @@ staged_albums_file_path = None
 cf_below_threshold = None
 cf_artists_per_run = None
 cf_artist_cursor_file_path = None
+recent_days = None
+recent_album_types = None
+recent_per_run = None
+recent_retry_hours = None
+recent_state_file_path = None
 promote_completed = None
 promote_verify_timeout = None
 recycle_bin = None
@@ -118,6 +124,7 @@ broken_user = []
 proof_seen_cache = {}
 single_dedup = None
 cf_sweep = None
+recent_sweep = None
 
 
 def album_match(lidarr_tracks, slskd_tracks, username, filetype):
@@ -1437,11 +1444,17 @@ def get_records(source: str) -> list:
     # cf_below records come from the CF sweep (its own rolling artist cursor —
     # search_type paging does not apply) and still pass through the same
     # queue filtering below.
-    global cf_sweep
+    global cf_sweep, recent_sweep
     if source == "cf_below":
         if cf_sweep is None:
             cf_sweep = CfSweep(lidarr, logger, threshold=cf_below_threshold, artists_per_run=cf_artists_per_run, cursor_path=cf_artist_cursor_file_path)
         wanted_records = cf_sweep.next_batch()
+    elif source == "recent":
+        # Fork: new releases (default singles/EPs) re-searched every
+        # recent_retry_hours until found; own state file, no search_type paging.
+        if recent_sweep is None:
+            recent_sweep = RecentSweep(lidarr, logger, days=recent_days, album_types=recent_album_types, per_run=recent_per_run, retry_hours=recent_retry_hours, state_path=recent_state_file_path)
+        wanted_records = recent_sweep.next_batch()
     else:
         wanted_records = get_wanted_records(missing=source == "missing")
 
@@ -1572,6 +1585,11 @@ def main():
         cf_below_threshold, \
         cf_artists_per_run, \
         cf_artist_cursor_file_path, \
+        recent_days, \
+        recent_album_types, \
+        recent_per_run, \
+        recent_retry_hours, \
+        recent_state_file_path, \
         promote_completed, \
         promote_verify_timeout, \
         recycle_bin, \
@@ -1588,7 +1606,8 @@ def main():
         broken_user, \
         proof_seen_cache, \
         single_dedup, \
-        cf_sweep
+        cf_sweep, \
+        recent_sweep
 
     # Let's allow some overrides to be passed to the script
     parser = argparse.ArgumentParser(description="""Soularr reads all of your "wanted" albums/artists from Lidarr and downloads them using Slskd""")
@@ -1635,6 +1654,7 @@ def main():
     staged_albums_file_path = os.path.join(args.var_dir, "staged_albums.json")
     orphan_sweep_state_file_path = os.path.join(args.var_dir, "orphan_sweep.json")
     cf_artist_cursor_file_path = os.path.join(args.var_dir, ".cf_artist_cursor.txt")
+    recent_state_file_path = os.path.join(args.var_dir, "recent_searched.json")
 
     if not is_docker() and os.path.exists(lock_file_path) and args.lock_file:
         logger.info(f"Soularr instance is already running.")
@@ -1727,6 +1747,11 @@ def main():
         orphan_sweep_max_attempts = config.getint("Download Settings", "orphan_sweep_max_attempts", fallback=4)
         cf_below_threshold = config.getint("Search Settings", "cf_below_threshold", fallback=0)
         cf_artists_per_run = config.getint("Search Settings", "cf_artists_per_run", fallback=10)
+        # recent source: missing albums released in the last recent_days days, newest first
+        recent_days = config.getint("Search Settings", "recent_days", fallback=60)
+        recent_album_types = sorted(fork_policy.parse_name_set(config.get("Search Settings", "recent_album_types", fallback="Single,EP")))
+        recent_per_run = config.getint("Search Settings", "recent_per_run", fallback=5)
+        recent_retry_hours = config.getint("Search Settings", "recent_retry_hours", fallback=24)
 
         use_selected_lidarr_release = config.getboolean("Release Settings", "use_selected_lidarr_release", fallback=False)
         use_most_common_tracknum = config.getboolean("Release Settings", "use_most_common_tracknum", fallback=True)
@@ -1757,6 +1782,7 @@ def main():
         proof_seen_cache = {}
         single_dedup = None
         cf_sweep = None
+        recent_sweep = None
 
         slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         lidarr = LidarrAPI(lidarr_host_url, lidarr_api_key)
@@ -1769,6 +1795,9 @@ def main():
             for source in search_sources:
                 logging.debug(f"Getting records from {source}")
                 wanted_records.extend(get_records(source))
+            # Fork: one album can come from two sources (a new single is both
+            # 'recent' and on the 'missing' page) - search it once.
+            wanted_records = fork_policy.dedupe_records(wanted_records)
         except ValueError as ex:
             logger.error(f"An error occurred: {ex}")
             logger.error("Exiting...")

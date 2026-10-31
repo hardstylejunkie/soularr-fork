@@ -48,8 +48,8 @@ def parse_name_set(raw):
 
 def parse_search_sources(raw):
     # search_source accepts a single source or a comma-separated list
-    # (missing | cutoff_unmet | cf_below); 'all' keeps its upstream meaning
-    # of missing+cutoff_unmet. Order is preserved, duplicates dropped.
+    # (missing | cutoff_unmet | cf_below | recent); 'all' keeps its upstream
+    # meaning of missing+cutoff_unmet. Order is preserved, duplicates dropped.
     sources = []
     for entry in (raw or "").split(","):
         entry = entry.strip().lower()
@@ -59,6 +59,22 @@ def parse_search_sources(raw):
             if source not in sources:
                 sources.append(source)
     return sources or ["missing"]
+
+
+def dedupe_records(records):
+    # Several sources can return the same album in one run (a new single is
+    # both 'recent' and on the current 'missing' page); keep the first copy so
+    # it is searched once. Records without an id pass through untouched.
+    seen = set()
+    unique = []
+    for record in records:
+        album_id = record.get("id") if isinstance(record, dict) else None
+        if album_id is not None:
+            if album_id in seen:
+                continue
+            seen.add(album_id)
+        unique.append(record)
+    return unique
 
 
 class TypePolicy:

@@ -308,3 +308,19 @@ class TestParseSearchSources:
         assert policy.parse_search_sources("") == ["missing"]
         assert policy.parse_search_sources(None) == ["missing"]
         assert policy.parse_search_sources(",,") == ["missing"]
+
+    def test_recent_first_in_list(self):
+        assert policy.parse_search_sources("recent,missing,cf_below") == ["recent", "missing", "cf_below"]
+
+
+class TestDedupeRecords:
+    def test_keeps_first_copy_in_order(self):
+        records = [{"id": 1, "src": "recent"}, {"id": 2}, {"id": 1, "src": "missing"}, {"id": 3}]
+        assert policy.dedupe_records(records) == [{"id": 1, "src": "recent"}, {"id": 2}, {"id": 3}]
+
+    def test_records_without_id_pass_through(self):
+        records = [{"title": "a"}, {"title": "a"}]
+        assert policy.dedupe_records(records) == records
+
+    def test_empty(self):
+        assert policy.dedupe_records([]) == []
